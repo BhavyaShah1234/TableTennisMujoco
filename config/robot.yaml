@@ -1,0 +1,46 @@
+# FR3 Robot Configuration
+# All parameters extracted from scene.xml
+
+robot:
+  name: "fr3"
+  n_dof: 7
+  
+  # Joint names (in order)
+  joint_names:
+    - "fr3_joint1"
+    - "fr3_joint2"
+    - "fr3_joint3"
+    - "fr3_joint4"
+    - "fr3_joint5"
+    - "fr3_joint6"
+    - "fr3_joint7"
+  
+  # Joint limits (radians)
+  joint_limits:
+    lower: [-2.9007, -1.8326, -2.9007, -3.0718, -2.8774, 0.4398, -3.0543]
+    upper: [2.9007, 1.8326, 2.9007, -0.1169, 2.8774, 4.6251, 3.0543]
+  
+  # Velocity limits (rad/s)
+  velocity_limits: [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26]
+  
+  # Torque limits (Nm)
+  torque_limits: [87, 87, 87, 87, 87, 87, 87]
+
+  # Robot base position in world frame (x, y, z)
+  base_position: [1.5, 0.0, 0.76]
+  
+  # Home configuration (safe starting position)
+  # joint4 must be in range [-3.07, -0.12], zero is outside this range
+  home_position: [0.0, 0.9, 0.0, 0.0, 0.0, 1.7, 1.5]
+
+end_effector:
+  name: "paddle"
+  body_name: "paddle"
+  site_name: "paddle_contact"
+  
+  # Paddle dimensions (from scene.xml)
+  blade_dimensions: [0.157, 0.152, 0.0065]  # length, width, thickness
+  mass: 0.09  # kg
+  
+  # Offset from link8 to paddle center
+  offset_from_link8: [0.0, 0.0, 0.157]

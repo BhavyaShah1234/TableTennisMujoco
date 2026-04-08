@@ -1,0 +1,34 @@
+# Controller Configuration
+
+control_frequency: 1000  # Hz
+
+default_mode: "computed_torque"
+
+pd_controller:
+  kp: [500.0, 500.0, 500.0, 500.0, 250.0, 250.0, 250.0]
+  kd: [80.0, 80.0, 80.0, 80.0, 40.0, 40.0, 40.0]
+
+pid_controller:
+  kp: [500.0, 500.0, 500.0, 500.0, 250.0, 250.0, 250.0]
+  kd: [80.0, 80.0, 80.0, 80.0, 40.0, 40.0, 40.0]
+  ki: [0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05]
+  max_integral: 10.0
+
+computed_torque:
+  kp: [300.0, 300.0, 300.0, 300.0, 150.0, 150.0, 150.0]
+  kd: [60.0, 60.0, 60.0, 60.0, 30.0, 30.0, 30.0]
+  use_gravity_compensation: true
+  use_coriolis_compensation: true
+
+velocity_controller:
+  kv: [50.0, 50.0, 50.0, 50.0, 25.0, 25.0, 25.0]
+
+impedance_controller:
+  desired_stiffness: [100.0, 100.0, 100.0, 100.0, 50.0, 50.0, 50.0]
+  desired_damping: [20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 10.0]
+  desired_inertia: null
+
+safety:
+  max_torque_scale: 0.95
+  max_joint_velocity: [2.5, 2.5, 2.5, 2.5, 5.0, 4.0, 5.0]
+  max_joint_acceleration: [15.0, 15.0, 15.0, 15.0, 20.0, 20.0, 20.0]
