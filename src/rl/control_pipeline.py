@@ -41,6 +41,7 @@ obs, rew, done, info = env.step(ctrl)
 
 import numpy as np
 import typing as t
+import mujoco
 from src.planner.trajectory_planner import MinimumJerkTrajectory
 from src.kinematics.inverse_kinematics import NumericalIKSolver, JacobianIKSolver
 from src.planner.trajectory_planner import MinimumJerkTrajectory, CubicSplineTrajectory, BSplineTrajectory, TrapezoidalVelocityTrajectory
@@ -62,8 +63,8 @@ WS_Y = (-0.70, 0.70)
 WS_Z = (0.75, 1.80)
 
 # Joint limits for the FR3 (radians)
-Q_MIN = np.array([-2.9007, -1.8326, -2.9007, -3.0718, -2.8774,  0.4398, -3.0543])
-Q_MAX = np.array([ 2.9007,  1.8326,  2.9007, -0.1169,  2.8774,  4.6251,  3.0543])
+Q_MIN = np.array([-2.9007, -1.8326, -2.9007, -3.0718, -2.8774, -0.0175, -3.0543])
+Q_MAX = np.array([ 2.9007,  1.8326,  2.9007, -0.0698,  2.8774,  3.7525,  3.0543])
 
 # Action space bounds for task-space normalisation (used in gym_env)
 ACTION_LOW_TASK  = np.array([WS_X[0], WS_Y[0], WS_Z[0], 0.10, -1,-1,-1, -5,-5,-5], dtype=np.float32)
@@ -113,6 +114,15 @@ class ControlPipeline:
             self.traj_gen = MinimumJerkTrajectory()
         else:
             self.traj_gen = traj_gen
+
+        # Cache whether the generator supports the max_steps kwarg so we don't
+        # call inspect.signature() inside the hot planning loop every step.
+        import inspect as _inspect
+        try:
+            _sig = _inspect.signature(self.traj_gen.generate_trajectory)
+            self._traj_supports_max_steps = "max_steps" in _sig.parameters
+        except Exception:
+            self._traj_supports_max_steps = False
 
         # Internal trajectory buffer
         self._traj: t.List[t.Dict] = []
@@ -231,7 +241,17 @@ class ControlPipeline:
             q_goal = self.home_pos.copy()
             ik_ok  = False
 
+        # Clamp per-joint delta so the trajectory T stays short enough for the
+        # robot to execute meaningful motion within the action_repeat window.
+        # Receding-horizon replanning (every policy step) lets the arm converge
+        # toward the IK target over multiple steps.
+        q_goal = np.clip(q_goal, current_q - self._DELTA_Q_MAX, current_q + self._DELTA_Q_MAX)
         q_goal = np.clip(q_goal, Q_MIN + 0.01, Q_MAX - 0.01)
+        # Note: the static torque-ratio fallback (mj_forward + mj_inverse per
+        # step) was removed for RL training throughput.  The instability guard
+        # in env.step() (qacc > 1e5) already terminates episodes that reach
+        # physically infeasible poses, so the fallback is not needed here.
+
         self._q_goal = q_goal
 
         # --- Trajectory ---
@@ -242,27 +262,55 @@ class ControlPipeline:
 
 
     def _plan_joint(self, action: np.ndarray, current_q: np.ndarray) -> bool:
-        """Direct joint-space action (normalised ∈ [-1,1] → joint targets)."""
-        # De-normalise from [-1, 1] to joint limits
-        q_goal = 0.5 * (Q_MAX + Q_MIN) + 0.5 * action * (Q_MAX - Q_MIN)
-        q_goal = np.clip(q_goal, Q_MIN + 0.01, Q_MAX - 0.01)
+        """Direct joint-space delta action (normalised ∈ [-1,1] → joint delta).
+
+        Skips trajectory planning entirely.  q_goal is held as the position
+        target for every inner sim step so the position controller (kp=200,
+        kd≈31 Nm·s/rad) has the full action_repeat window (20 ms) to build
+        velocity toward the target, rather than chasing a near-zero ramp for
+        the first 15 of 20 inner steps (MinimumJerk flat start).
+
+        With _DELTA_Q_MAX = 0.25 rad/step the controller reaches roughly
+        0.02–0.06 rad actual movement per step depending on joint inertia,
+        giving clear visible arm motion at 50 Hz while staying within FR3
+        velocity limits in simulation.
+        """
+        delta  = action * self._DELTA_Q_MAX
+        q_goal = np.clip(current_q + delta, Q_MIN + 0.01, Q_MAX - 0.01)
         self._q_goal = q_goal
 
-        # Trajectory over a fixed window
-        T = self.t_exec_joint
-        self._generate_traj(current_q, q_goal, T)
+        # Broadcast q_goal across all inner steps — no trajectory overhead.
+        _zero = np.zeros_like(q_goal)
+        traj_pt = {"position": q_goal, "velocity": _zero, "acceleration": _zero}
+        self._traj = [traj_pt] * self.action_repeat
         self._plan_ok = True
         return True
 
     # Maximum safe joint speed (rad/s) — used to enforce minimum trajectory time
     # FR3 joint speed limits: ~2.62 rad/s, use 50% of that to stay stable
     _MAX_SAFE_JOINT_SPEED = 1.0
+    # Maximum joint delta per policy step (joint_space mode: delta actions;
+    # task_space mode: per-joint IK output clamping).
+    # 0.25 rad/step: controller (kp=200, kd≈31) reaches ~0.02–0.06 rad actual
+    # displacement per step depending on joint inertia — visible arm motion at
+    # 50 Hz.  Implied velocity (0.25×50=12.5 rad/s) is a commanded reference;
+    # actual joint velocity is bounded by the controller response and inertia,
+    # staying within FR3 limits in simulation.
+    _DELTA_Q_MAX = 0.25
     _PADDLE_BLADE_HALF_THICKNESS = 0.00325
     _CONTACT_MARGIN = 0.002
+    _MAX_STATIC_TORQUE_RATIO = 0.95
 
     def _generate_traj(self, q_start: np.ndarray, q_goal: np.ndarray, T: float):
-        """Generate a joint-space trajectory and store in self._traj."""
-        # Enforce a minimum T so that the commanded joint velocities stay physical
+        """Generate a joint-space trajectory at simulation dt resolution.
+
+        The full trajectory from q_start → q_goal spans T seconds.  Only the
+        first ``action_repeat`` points (one per inner sim step = dt seconds
+        each) are kept in ``self._traj`` so that ``get_ctrl(inner_step)``
+        delivers a correctly-timed position target every 1 ms, rather than
+        jumping through T/(action_repeat-1) seconds of motion in a single step.
+        """
+        # Enforce a minimum T so that commanded joint velocities stay physical.
         max_delta = float(np.max(np.abs(q_goal - q_start)))
         T_min_kinematic = max_delta / self._MAX_SAFE_JOINT_SPEED
         T_min_action    = self.dt * self.action_repeat
@@ -270,16 +318,56 @@ class ControlPipeline:
 
         waypoints = np.stack([q_start, q_goal])
         times     = np.array([0.0, T])
-        # Produce exactly action_repeat steps (one per inner loop step)
-        traj_dt   = T / max(self.action_repeat - 1, 1)
+        # Generate at 1 ms (dt) resolution so each sim step receives the
+        # trajectory point that is correct for that moment in time.
+        # Pass max_steps so generators that support it (e.g. MinimumJerkTrajectory)
+        # compute only the action_repeat points we will actually use, avoiding
+        # the O(T/dt) work needed to generate then discard the rest of the path.
+        gen_kwargs: dict = {"max_steps": self.action_repeat} if self._traj_supports_max_steps else {}
+
         try:
-            full = self.traj_gen.generate_trajectory(waypoints, times, traj_dt)
+            full = self.traj_gen.generate_trajectory(waypoints, times, self.dt, **gen_kwargs)
         except Exception:
-            # Fallback: linear interpolation
+            # Fallback: linear interpolation at dt resolution
+            n = self.action_repeat
             full = []
-            for i in range(self.action_repeat):
-                alpha = i / max(self.action_repeat - 1, 1)
+            for i in range(n):
+                alpha = i / max(n - 1, 1)
                 full.append({"position": q_start + alpha * (q_goal - q_start),
                              "velocity": np.zeros(len(q_start)),
                              "acceleration": np.zeros(len(q_start))})
-        self._traj = full
+        # Retain only the first action_repeat steps: the portion of the
+        # trajectory that this policy step will execute.
+        self._traj = full[:self.action_repeat]
+
+    def _estimate_static_torque_ratio(self, q_goal: np.ndarray) -> float:
+        """Estimate hold-torque demand ratio (required / actuator limit) at q_goal."""
+        saved_qpos = self.env.data.qpos.copy()
+        saved_qvel = self.env.data.qvel.copy()
+        saved_qacc = self.env.data.qacc.copy()
+        try:
+            self.env.data.qpos[:self.env.n_dof] = q_goal
+            self.env.data.qvel[:self.env.n_dof] = 0.0
+            self.env.data.qacc[:self.env.n_dof] = 0.0
+            mujoco.mj_forward(self.env.model, self.env.data)
+            mujoco.mj_inverse(self.env.model, self.env.data)
+
+            tau_req = self.env.data.qfrc_inverse[:self.env.n_dof]
+            ratio_max = 0.0
+            for i in range(self.env.n_dof):
+                if int(self.env.model.actuator_forcelimited[i]) == 0:
+                    continue
+                f_max = float(max(
+                    abs(self.env.model.actuator_forcerange[i, 0]),
+                    abs(self.env.model.actuator_forcerange[i, 1]),
+                    1e-6,
+                ))
+                ratio = abs(float(tau_req[i])) / f_max
+                if ratio > ratio_max:
+                    ratio_max = ratio
+            return ratio_max
+        finally:
+            self.env.data.qpos[:] = saved_qpos
+            self.env.data.qvel[:] = saved_qvel
+            self.env.data.qacc[:] = saved_qacc
+            mujoco.mj_forward(self.env.model, self.env.data)

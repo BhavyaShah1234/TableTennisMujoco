@@ -77,29 +77,53 @@ class MinimumJerkTrajectory(BaseTrajectoryGenerator):
         self.q_goal = None
         self.T = None
     
-    def generate_trajectory(self, waypoints: np.ndarray, times: np.ndarray, dt: float) -> t.List[t.Dict[str, np.ndarray]]:
+    def generate_trajectory(self, waypoints: np.ndarray, times: np.ndarray, dt: float,
+                            max_steps: t.Optional[int] = None) -> t.List[t.Dict[str, np.ndarray]]:
         """
         Generate minimum jerk trajectory.
-        
+
         For minimum jerk, we only use first and last waypoints (point-to-point).
+
+        Parameters
+        ----------
+        max_steps : int | None
+            When set, generate at most this many trajectory points (evaluated at
+            dt resolution from t=0).  Avoids computing thousands of points when
+            only a small prefix is needed (e.g. action_repeat in RL).
         """
         if len(waypoints) < 2:
             raise ValueError("Need at least 2 waypoints")
-        
+
         self.q_start = waypoints[0]
         self.q_goal = waypoints[-1]
         self.T = times[-1] - times[0]
-        
-        # Generate trajectory points
-        trajectory = []
+
         num_steps = int(self.T / dt) + 1
-        
-        for i in range(num_steps):
-            t = i * dt
-            state = self.evaluate_at_time(t)
-            trajectory.append(state)
-        
-        return trajectory
+        if max_steps is not None:
+            num_steps = min(num_steps, max_steps)
+
+        # Vectorised evaluation — avoids N Python-level function calls.
+        ts  = np.arange(num_steps, dtype=np.float64) * dt
+        tau = np.clip(ts / self.T, 0.0, 1.0)
+
+        s   = 10*tau**3 - 15*tau**4 + 6*tau**5
+        sd  = (30*tau**2 - 60*tau**3 + 30*tau**4) / self.T
+        sdd = (60*tau - 180*tau**2 + 120*tau**3) / (self.T**2)
+
+        delta_q = self.q_goal - self.q_start
+        positions     = self.q_start + np.outer(s,   delta_q)
+        velocities    = np.outer(sd,  delta_q)
+        accelerations = np.outer(sdd, delta_q)
+
+        return [
+            {
+                "time":         ts[i],
+                "position":     positions[i],
+                "velocity":     velocities[i],
+                "acceleration": accelerations[i],
+            }
+            for i in range(num_steps)
+        ]
     
     def evaluate_at_time(self, t: float) -> t.Dict[str, np.ndarray]:
         """Evaluate minimum jerk trajectory at time t."""

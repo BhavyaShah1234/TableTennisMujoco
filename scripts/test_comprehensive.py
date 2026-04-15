@@ -41,6 +41,7 @@ from src.rl.gym_env import Environment
 from src.kinematics.inverse_kinematics import NumericalIKSolver
 from src.planner.trajectory_planner import MinimumJerkTrajectory
 from src.utils.utils import load_config
+from src.rl.control_pipeline import WS_X, WS_Y, WS_Z
 
 # ============================================================
 # LOAD ALL CONFIGURATION FROM YAML FILES
@@ -97,10 +98,8 @@ COR       = _T["bounce_cor"]                               # empirical predictor
 FLOOR_Z   = _BALL_CFG["ground_z_threshold"]
 MIN_REACT = 0.08   # min seconds before intercept is acceptable
 
-# ---- robot workspace (reachable volume of the paddle, from control_pipeline)
-WS_X = (0.78, 1.80)
-WS_Y = (-0.65, 0.65)
-WS_Z = (0.78, 1.72)
+# ---- robot workspace: imported from control_pipeline to stay in sync.
+# WS_X, WS_Y, WS_Z imported above from src.rl.control_pipeline.
 
 
 # ============================================================
@@ -151,7 +150,7 @@ def predict_intercept(ball_pos, ball_vel):
     # ── Phase 1: find first table bounce ─────────────────────────────────────
     dt_hit = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
     if dt_hit is None:
-        return None, None, None
+        return None, None, None, None
 
     hit_p = _pos_at(pos, vel, dt_hit)
     hit_v = _vel_at(vel, dt_hit)
@@ -272,7 +271,8 @@ def _fmt(ok, msg):
     return f"  {'OK PASS' if ok else 'XX FAIL'}  {msg}"
 
 def _log(t, pos, vel, event=""):
-    base = (f"  {t:6.3f}  {pos[0]:7.3f} {pos[1]:7.3f} {pos[2]:7.3f}  "            f"{vel[0]:7.3f} {vel[1]:7.3f} {vel[2]:7.3f}")
+    base = (f"  {t:6.3f}  {pos[0]:7.3f} {pos[1]:7.3f} {pos[2]:7.3f}  "
+            f"{vel[0]:7.3f} {vel[1]:7.3f} {vel[2]:7.3f}")
     print(base + (f"  {event}" if event else ""))
 
 
@@ -572,6 +572,7 @@ def main():
         pass
     ik = NumericalIKSolver(model=env.model, data=env.data,
                             end_effector_body="paddle", end_effector_site="paddle_contact",
+                            end_effector_normal_site="paddle_normal",
                             position_weight=1.0, orientation_weight=0.25,
                             max_iterations=500)
     traj_gen  = MinimumJerkTrajectory()

@@ -1,7 +1,7 @@
 <mujoco model="table_tennis_scene">
   <compiler angle="radian" meshdir="meshes" autolimits="true"/>
 
-  <option timestep="0.001" integrator="Euler" iterations="100" solver="Newton" tolerance="1e-10">
+  <option timestep="0.001" integrator="implicitfast" iterations="100" solver="Newton" tolerance="1e-10">
     <flag gravity="enable" contact="enable"/>
   </option>
 
@@ -127,7 +127,7 @@
             <geom type="mesh" mesh="link3_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
             <body name="fr3_link4" pos="0.0825 0 0" quat="0.707107 0.707107 0 0">
               <inertial pos="-0.0532 0.0459 0.0227" mass="2.3883" diaginertia="0.0079 0.0068 0.0073"/>
-              <joint name="fr3_joint4" type="hinge" axis="0 0 1" range="-3.0718 -0.1169" damping="1" frictionloss="0.1"/>
+              <joint name="fr3_joint4" type="hinge" axis="0 0 1" range="-3.0718 -0.0698" damping="1" frictionloss="0.1"/>
               <geom type="mesh" mesh="link4_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
               <body name="fr3_link5" pos="-0.0825 0.384 0" quat="0.707107 -0.707107 0 0">
                 <inertial pos="0.0001 -0.0614 0.0304" mass="2.7337" diaginertia="0.0136 0.0114 0.0049"/>
@@ -135,7 +135,7 @@
                 <geom type="mesh" mesh="link5_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
                 <body name="fr3_link6" pos="0 0 0" quat="0.707107 0.707107 0 0">
                   <inertial pos="0.0511 0.0094 0.0009" mass="1.6667" diaginertia="0.0024 0.0021 0.0021"/>
-                  <joint name="fr3_joint6" type="hinge" axis="0 0 1" range="0.4398 4.6251" damping="0.5" frictionloss="0.1"/>
+                  <joint name="fr3_joint6" type="hinge" axis="0 0 1" range="-0.0175 3.7525" damping="0.5" frictionloss="0.1"/>
                   <geom type="mesh" mesh="link6_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
                   <body name="fr3_link7" pos="0.088 0 0" quat="0.707107 0.707107 0 0">
                     <inertial pos="0.0099 0.0099 0.0235" mass="0.7355" fullinertia="0.0015 0.0014 0.0005 0.0001 0.0001 0.0001"/>
@@ -146,11 +146,18 @@
                       <body name="paddle" pos="0 0 0.157" quat="1 0 0 0">
                         <inertial pos="0 0 0" mass="0.09" fullinertia="0.0002 0.0002 0.00005 0 0 0"/>
                         <!-- <geom type="mesh" mesh="paddle_mesh" pos="0 0 -0.05" quat="0.707107 0 0.707107 0" material="paddle_red" contype="1" conaffinity="1" group="0"/> -->
-                        <geom type="mesh" mesh="paddle_mesh" pos="0 0 0" euler="1.5708 0 0" material="paddle_red" contype="1" conaffinity="1" group="0"/>
-                        <geom name="paddle_blade" type="box" size="0.0785 0.076 0.00325" pos="0 0 0" friction="0.8 0.005 0.0001" contype="1" conaffinity="1" group="3" rgba="0.8 0.1 0.1 0.8"/>
+                        <!-- euler="1.5708 0 0" = Rx(90°): maps STL-Y (long axis, handle at -Y)
+                             to body-Z so the handle points toward link7 (body -Z direction).
+                             STL-Z (blade face normal) maps to body -Y, so face normal = body -Y. -->
+                        <geom type="mesh" mesh="paddle_mesh" pos="0 0 0" euler="1.5708 0 0" material="paddle_red" contype="0" conaffinity="0" group="0"/>
+                        <!-- Blade box: thin in Y (= face-normal direction, body -Y).
+                             Z extent covers blade impact area along arm axis. -->
+                        <geom name="paddle_blade" type="box" size="0.0785 0.00325 0.076" pos="0 0 0" friction="0.8 0.005 0.0001" contype="1" conaffinity="1" group="3" rgba="0.8 0.1 0.1 0.8"/>
                         <geom name="paddle_handle" type="cylinder" size="0.0125 0.05" pos="0 0 -0.075" friction="0.8 0.005 0.0001" contype="1" conaffinity="1" group="3" rgba="0.6 0.4 0.2 1"/>
                         <site name="paddle_contact" pos="0 0 0" size="0.01" rgba="0 1 0 0.3"/>
-                        <site name="paddle_normal" pos="0 0 0.01" euler="1.5708 0 0" size="0.005" rgba="0 0 1 0.5"/>
+                        <!-- paddle_normal is 1 cm in body -Y: face normal = body -Y direction,
+                             perpendicular to the visual mesh blade face after the euler rotation. -->
+                        <site name="paddle_normal" pos="0 -0.01 0" size="0.005" rgba="0 0 1 0.5"/>
                       </body>
                     </body>
                   </body>
@@ -185,9 +192,9 @@
     <position name="pos_joint1" joint="fr3_joint1" kp="200" kv="20" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
     <position name="pos_joint2" joint="fr3_joint2" kp="200" kv="20" ctrlrange="-1.8326 1.8326" forcerange="-87 87"/>
     <position name="pos_joint3" joint="fr3_joint3" kp="200" kv="20" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
-    <position name="pos_joint4" joint="fr3_joint4" kp="200" kv="20" ctrlrange="-3.0718 -0.1169" forcerange="-87 87"/>
+    <position name="pos_joint4" joint="fr3_joint4" kp="200" kv="20" ctrlrange="-3.0718 -0.0698" forcerange="-87 87"/>
     <position name="pos_joint5" joint="fr3_joint5" kp="200" kv="20" ctrlrange="-2.8774 2.8774" forcerange="-87 87"/>
-    <position name="pos_joint6" joint="fr3_joint6" kp="200" kv="20" ctrlrange="0.4398 4.6251" forcerange="-87 87"/>
+    <position name="pos_joint6" joint="fr3_joint6" kp="200" kv="20" ctrlrange="-0.0175 3.7525" forcerange="-87 87"/>
     <position name="pos_joint7" joint="fr3_joint7" kp="200" kv="20" ctrlrange="-3.0543 3.0543" forcerange="-87 87"/>
     <motor name="torque_joint1" joint="fr3_joint1" gear="1" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="torque_joint2" joint="fr3_joint2" gear="1" ctrlrange="-87 87" ctrllimited="true"/>

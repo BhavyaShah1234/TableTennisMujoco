@@ -17,8 +17,8 @@ robot:
   
   # Joint limits (radians)
   joint_limits:
-    lower: [-2.9007, -1.8326, -2.9007, -3.0718, -2.8774, 0.4398, -3.0543]
-    upper: [2.9007, 1.8326, 2.9007, -0.1169, 2.8774, 4.6251, 3.0543]
+    lower: [-2.9007, -1.8326, -2.9007, -3.0718, -2.8774, -0.0175, -3.0543]
+    upper: [2.9007, 1.8326, 2.9007, -0.0698, 2.8774, 3.7525, 3.0543]
   
   # Velocity limits (rad/s)
   velocity_limits: [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26]
@@ -30,8 +30,8 @@ robot:
   base_position: [1.5, 0.0, 0.76]
   
   # Home configuration (safe starting position)
-  # joint4 must be in range [-3.07, -0.12], zero is outside this range
-  home_position: [0.0, 0.9, 0.0, 0.0, 0.0, 1.7, 1.5]
+  # Keep this synchronized with assets/scene.xml keyframe "home".
+  home_position: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.785]
 
 end_effector:
   name: "paddle"

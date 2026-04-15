@@ -9,18 +9,26 @@ Call reset() at the start of each episode, then update() after every step.
 Reward hierarchy (worst → best)
 --------------------------------
     −20   No reaction      — robot barely moved + missed the ball
+                             (miss −10, stationary −5, approach ≈ −5)
     −10   Not reached      — robot moved but ball passed without contact
-     −3   Early hit        — paddle touched ball BEFORE first table bounce
-                                                     (touch=+5, early_hit=−8)
-        0   No hit           — ball bounced, robot didn't touch it
-     +5   Touch            — paddle first contacts ball AFTER first bounce
-     +8   Other-side touch — touch using opposite paddle face (extra +3)
-    +18   Far table        — touch + ball lands on opponent's table (+accuracy)
+                             (miss −10, approach ≈ 0)
+     −8   Early hit        — paddle touched ball BEFORE first table bounce
+                             (touch +5, early_hit −8, no-net −3, approach ≈ −2)
+     −6   Back-face hit    — ball contacted with wrong paddle side, goes backward
+                             (touch +5, other_side −3, no-net −3, approach ≈ −5)
+     −1   Backward hit     — front face, ball doesn't cross net
+                             (touch +5, no-net −3, approach ≈ −3)
+     +3   Correct touch    — post-bounce, front face, ball crosses net
+                             (touch +5, approach ≈ −2)
+     +5   Ideal touch      — correct + paddle below descending ball (from below +2)
+    +15   Far table        — ideal touch + ball lands on opponent's table
 
 Net contact and over-net transitions are tracked for diagnostics only.
 They do not add positive reward.
 
-All per-step dense terms are tiny regularisers that cannot reorder the levels:
+Per-step dense terms:
+  approach reward     : R_APPROACH_PROGRESS × (prev_dist − curr_dist) — progress shaping
+                        (positive when getting closer, 0.5× pre-bounce; max ≈ ±2.7 total)
   joint-limit penalty : max ≈ −0.001 / step
   jerk penalty        : max ≈ −0.0002 / step
 
@@ -43,7 +51,9 @@ BALL_R       =  0.020
 
 # ── Sparse reward values ─────────────────────────────────────────────────────
 R_TOUCH         =  +5.0   # paddle contacts ball AFTER first bounce
-R_TOUCH_OTHER_SIDE = +3.0 # extra reward when contact uses opposite face
+R_TOUCH_OTHER_SIDE = -3.0 # penalty: back-face contact pushes ball backward; was +3.0
+R_FROM_BELOW    =  +2.0   # bonus: paddle below ball while ball descends (correct technique)
+R_HIT_NO_NET    =  -3.0   # terminal: ball was hit but never crossed net
 R_NET_CONTACT   =   0.0   # tracked only; no positive reward
 R_OVER_NET      =   0.0   # tracked only; no positive reward
 R_FAR_SIDE      = +10.0   # additional: ball lands on far table      → cumulative +25
@@ -54,18 +64,30 @@ R_STATIONARY    =  -5.0   # extra penalty on top of miss when robot barely moved
                            # → "no reaction" total ≈ −10 + (−5) = −15 + tiny per-step ≈ −20
 R_EARLY_HIT     =  -8.0   # hit before first bounce; net with R_TOUCH = +5 − 8 = −3
 
+# ── Dense approach reward: progress-based shaping ────────────────────────────
+# Rewards the agent for REDUCING distance between paddle and ball (positive when
+# getting closer, negative when moving away).  Unlike an absolute-distance
+# penalty, this fires positive reward even when the agent holds still while the
+# ball naturally approaches — giving the policy an immediate warm signal before
+# it has learned to move toward the ball.
+#
+# Scale: at 1 m/s ball velocity, each inner step reduces distance by ~1 mm.
+# R_APPROACH_PROGRESS × 0.001 m/step × 900 steps ≈ ±2.7 max episode shaping.
+# Kept below miss penalty (−10) so sparse signals still dominate.
+R_APPROACH_PROGRESS = 3.0  # reward per metre of distance reduction per inner step
+
 # ── Per-step regularisation (tiny — cannot reorder sparse levels) ────────────
 R_LIMIT_MAX  = -0.001    # per-step, per-joint-violation
 R_JERK_MAX   = -0.0002   # per-step
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
-TOUCH_DIST_THRESHOLD      = 0.08   # m   — paddle within this → contact
+TOUCH_DIST_THRESHOLD      = 0.15   # m   — paddle within this → contact
 STATIONARY_MOVE_THRESHOLD = 0.10   # rad — cumulative joint movement below this
                                    #       → episode treated as "no reaction"
 JOINT_LIMIT_MARGIN        = 0.15   # rad — start penalising below this margin
 
-Q_MIN = np.array([-2.9007, -1.8326, -2.9007, -3.0718, -2.8774,  0.4398, -3.0543])
-Q_MAX = np.array([ 2.9007,  1.8326,  2.9007, -0.1169,  2.8774,  4.6251,  3.0543])
+Q_MIN = np.array([-2.9007, -1.8326, -2.9007, -3.0718, -2.8774, -0.0175, -3.0543])
+Q_MAX = np.array([ 2.9007,  1.8326,  2.9007, -0.0698,  2.8774,  3.7525,  3.0543])
 
 # Net geom names (from scene.xml) — used for ball↔net contact detection
 _NET_GEOMS = {"net_collision", "net_top_edge"}
@@ -116,6 +138,7 @@ class RewardCalculator:
         self._prev_joint_pos: t.Optional[np.ndarray] = None
         self._prev_joint_vel: t.Optional[np.ndarray] = None
         self._cumulative_joint_movement  = 0.0
+        self._prev_paddle_ball_dist: t.Optional[float] = None
 
         self._episode_reward = 0.0
 
@@ -171,7 +194,11 @@ class RewardCalculator:
         if self._hit_just_detected and self._hit_after_bounce:
             r += R_TOUCH
             if self._other_side_hit_just_detected:
-                r += R_TOUCH_OTHER_SIDE
+                r += R_TOUCH_OTHER_SIDE  # −3: back-face contact pushes ball backward
+            else:
+                # Correct technique bonus: paddle below ball while ball descends
+                if ball_vel[2] < 0 and paddle_pos[2] < ball_pos[2]:
+                    r += R_FROM_BELOW
 
         # ── Sparse: early hit penalty (−8); R_TOUCH (+5) already added ───
         # Net = +5 − 8 = −3  →  sits between "miss" (−10) and "no hit" (0)
@@ -207,6 +234,33 @@ class RewardCalculator:
                 and not self._hit_detected
                 and self._cumulative_joint_movement < STATIONARY_MOVE_THRESHOLD):
             r += R_STATIONARY
+
+        # ── Sparse: terminal no-net penalty (−3) ─────────────────────────
+        # Ball was hit (post-bounce, front face) but never crossed the net —
+        # penalise to discourage hitting backward or into the net.
+        if (done_reason is not None
+                and self._hit_detected
+                and self._hit_after_bounce
+                and not self._hit_with_other_side
+                and not self._over_net
+                and not self._net_contacted):
+            r += R_HIT_NO_NET
+
+        # ── Dense: progress-based approach reward (pre-hit) ──────────────
+        # Reward = R_APPROACH_PROGRESS × (prev_dist − curr_dist).
+        # Positive when paddle moves toward ball (or ball moves toward paddle).
+        # Negative when paddle moves away.  Net shaping over an episode is
+        # bounded by the total distance traversed (~2-3 m range), so it
+        # cannot dominate the sparse reward hierarchy.
+        # Pre-bounce scale = 0.5× to encourage pre-positioning without
+        # overwhelming the post-bounce interception signal.
+        if not self._hit_detected:
+            curr_dist = float(np.linalg.norm(paddle_pos - ball_pos))
+            if self._prev_paddle_ball_dist is not None:
+                scale = 1.0 if self._bounce_logged else 0.5
+                progress = self._prev_paddle_ball_dist - curr_dist
+                r += scale * R_APPROACH_PROGRESS * progress
+            self._prev_paddle_ball_dist = curr_dist
 
         # ── Dense: joint-limit regularisation (tiny, max ≈ −0.001/step) ──
         r += self._joint_limit_penalty(joint_pos)

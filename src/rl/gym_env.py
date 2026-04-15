@@ -44,15 +44,18 @@ from src.utils.utils import load_config
 
 
 # ── Observation constants ────────────────────────────────────────────────────
-OBS_DIM       = 19   # [ball_pos(3) ball_vel(3) ball_spin(3) joint_pos(7) paddle_normal(3)]
+# Layout: [ball_pos(3) ball_vel(3) ball_spin(3) joint_pos(7) paddle_normal(3)
+#           paddle_pos(3) predicted_ball_pos(3)]
+OBS_DIM       = 25
 ACT_DIM_TASK  = 10
 ACT_DIM_JOINT =  7
 
 OBS_LOW  = np.full(OBS_DIM, -10.0, dtype=np.float32)
 OBS_HIGH = np.full(OBS_DIM,  10.0, dtype=np.float32)
-OBS_LOW[0:3]   = np.array([-2.0, -1.5, -0.5], dtype=np.float32)
-OBS_HIGH[0:3]  = np.array([ 2.0,  1.5,  3.0], dtype=np.float32)
-OBS_LOW[16:19] = OBS_HIGH[16:19] = None  # reset before assigning
+# Ball position and predicted ball position bounds (x,y,z)
+for _sl in (slice(0, 3), slice(19, 22), slice(22, 25)):
+    OBS_LOW[_sl]  = np.array([-2.0, -1.5, -0.5], dtype=np.float32)
+    OBS_HIGH[_sl] = np.array([ 2.0,  1.5,  3.0], dtype=np.float32)
 OBS_LOW[16:19]  = -1.0   # paddle normal is a unit vector ∈ [-1, 1]
 OBS_HIGH[16:19] =  1.0
 
@@ -64,10 +67,19 @@ def _build_ik(name: t.Optional[str], model, data) -> t.Optional[object]:
     if name is None or name == "None":
         return None
     from src.kinematics.inverse_kinematics import NumericalIKSolver, JacobianIKSolver
-    common = dict(model=model, data=data, end_effector_body="paddle", end_effector_site="paddle_contact")
+    common = dict(
+        model=model,
+        data=data,
+        end_effector_body="paddle",
+        end_effector_site="paddle_contact",
+        end_effector_normal_site="paddle_normal",
+    )
     if name == "NumericalIKSolver":
+        # 50 iterations is sufficient for RL training: the receding-horizon
+        # pipeline replans every 20 ms so high IK precision is not critical,
+        # and a tight iteration budget keeps training throughput acceptable.
         return NumericalIKSolver(**common, position_weight=1.0,
-                                 orientation_weight=0.25, max_iterations=500)
+                                 orientation_weight=0.25, max_iterations=50)
     if name == "JacobianIKSolver":
         return JacobianIKSolver(**common, step_size=0.1,
                                 max_iterations=500, tolerance=5e-3)
@@ -182,7 +194,14 @@ class Environment(gym.Env):
             raise ValueError(
                 f"config/robot.yaml must define robot.home_position with {self.n_dof} values"
             )
-        self.home_position = cfg_home.copy()
+        jnt_min = self.model.jnt_range[:self.n_dof, 0].copy()
+        jnt_max = self.model.jnt_range[:self.n_dof, 1].copy()
+        if np.any(cfg_home < jnt_min) or np.any(cfg_home > jnt_max):
+            clipped = np.clip(cfg_home, jnt_min, jnt_max)
+            print("Warning: robot.home_position was outside scene joint limits; clamping to valid range")
+            self.home_position = clipped
+        else:
+            self.home_position = cfg_home.copy()
 
         # ── RL configuration ──────────────────────────────────────────────
         self.mode          = mode
@@ -304,7 +323,20 @@ class Environment(gym.Env):
         done    : ``True`` when a termination condition fires
         info    : ``dict`` with ``episode_time``, ``episode_steps``, ``done_reason``
         """
+        # Feed-forward gravity + Coriolis compensation via motor actuators so
+        # position actuators only handle tracking errors (matches real Franka
+        # behaviour where the inner torque controller cancels gravity).
+        # qfrc_bias is valid from the previous mj_step / mj_forward call.
+        tau_ff = np.clip(self.data.qfrc_bias[:self.n_dof], -87.0, 87.0)
+        self.data.ctrl[self.n_dof:2 * self.n_dof] = tau_ff
         self.data.ctrl[:self.n_dof] = ctrl_commands
+        # Passive velocity damping via velocity actuators (ctrl=0 → force = −kv·qdot).
+        # Suppresses the 500 Hz Nyquist-frequency oscillation that builds in the
+        # wrist joints at peak trajectory velocities and then couples into joint 7
+        # runaway spin through Coriolis terms.  kv_vel=10 raises effective damping
+        # from 20 to 30, keeping the discrete-time position loop well inside its
+        # stability margin without opposing desired trajectory motion significantly.
+        self.data.ctrl[2 * self.n_dof:3 * self.n_dof] = 0.0
         mujoco.mj_step(self.model, self.data)
         self.episode_time  += self.dt
         self.episode_steps += 1
@@ -320,7 +352,9 @@ class Environment(gym.Env):
 
     def set_robot_joints(self, positions: np.ndarray, velocities: t.Optional[np.ndarray] = None):
         """Set robot joint positions and optionally velocities."""
-        self.data.qpos[:self.n_dof] = positions
+        q_min = self.model.jnt_range[:self.n_dof, 0]
+        q_max = self.model.jnt_range[:self.n_dof, 1]
+        self.data.qpos[:self.n_dof] = np.clip(positions, q_min, q_max)
         if velocities is not None:
             self.data.qvel[:self.n_dof] = velocities
         else:
@@ -472,23 +506,50 @@ class Environment(gym.Env):
         ])
 
     def get_paddle_normal(self) -> np.ndarray:
-        """Return the unit normal of the paddle face (local Z → world frame)."""
-        mat     = self.data.site_xmat[self._paddle_normal_site_id].reshape(3, 3)
-        normal  = mat[:, 2].copy()
-        norm    = float(np.linalg.norm(normal))
-        return normal / norm if norm > 1e-9 else np.array([0.0, 0.0, 1.0])
+        """Return the unit normal of the paddle face in world frame.
+
+        The visual mesh has euler="1.5708 0 0" (Rx(90°)) so the blade face
+        normal is body -Y (not body +Z).  site_xmat columns are body-frame
+        axes in world space: column 1 = body +Y, so we negate it.
+        """
+        mat    = self.data.site_xmat[self._paddle_normal_site_id].reshape(3, 3)
+        normal = -mat[:, 1].copy()   # body -Y = paddle face normal
+        norm   = float(np.linalg.norm(normal))
+        return normal / norm if norm > 1e-9 else np.array([0.0, -1.0, 0.0])
 
     def get_rl_observation(self) -> np.ndarray:
-        """19-D RL observation: ``[ball(9), joint_pos(7), paddle_normal(3)]``."""
+        """25-D RL observation:
+        ``[ball_pos(3) ball_vel(3) ball_spin(3) joint_pos(7) paddle_normal(3)
+           paddle_pos(3) predicted_ball_pos(3)]``
+
+        ``paddle_pos``: direct end-effector world position (avoids the policy
+        having to learn forward-kinematics from joint angles implicitly).
+
+        ``predicted_ball_pos``: ballistic extrapolation 10 policy steps ahead
+        (10 × action_repeat × dt seconds), giving the policy a lead-the-ball
+        signal rather than chasing the current position.
+        """
         ball   = self.get_ball_state()
         robot  = self.get_robot_state()
         normal = self.get_paddle_normal()
+        paddle_pos, _ = self.get_end_effector_pose()
+
+        # Ballistic prediction: 10 policy steps ahead (gravity-corrected)
+        dt_ahead = 10.0 * self.action_repeat * self.dt   # e.g. 10×20×0.001 = 0.2 s
+        g_vec    = np.array([0.0, 0.0, -9.81], dtype=np.float64)
+        ball_pred = (ball["position"] + ball["velocity"] * dt_ahead
+                     + 0.5 * g_vec * dt_ahead ** 2)
+        # Clip predicted z: ball can't go below table surface after bounce
+        ball_pred[2] = max(ball_pred[2], -0.5)
+
         return np.concatenate([
-            ball["position"],    # 3
-            ball["velocity"],    # 3
-            ball["spin"],        # 3
-            robot["position"],   # 7
-            normal,              # 3
+            ball["position"],            # 3  indices 0-2
+            ball["velocity"],            # 3  indices 3-5
+            ball["spin"],                # 3  indices 6-8
+            robot["position"],           # 7  indices 9-15
+            normal,                      # 3  indices 16-18
+            paddle_pos.astype(np.float64),  # 3  indices 19-21
+            ball_pred,                   # 3  indices 22-24
         ]).astype(np.float32)
 
     def get_simulation_time(self) -> float:

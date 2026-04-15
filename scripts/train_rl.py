@@ -44,6 +44,7 @@ def parse_args():
     p.add_argument("--log-dir", default=cfg["logging"]["log_dir"])
     p.add_argument("--no-eval", action="store_true", help="Skip periodic evaluation (faster)")
     p.add_argument("--render", action="store_true", help="Launch MuJoCo viewer during evaluation")
+    p.add_argument("--eval-episodes", type=int, default=None, help="Episodes per evaluation (overrides config)")
     p.add_argument("--load", default=None, help="Path to existing model to continue training")
     return p.parse_args(), cfg
 
@@ -189,7 +190,7 @@ def main():
     # ── Training loop with periodic eval ───────────────────────────
     eval_cfg   = cfg["training"]
     eval_freq  = eval_cfg["eval_freq"]
-    n_eval_ep  = eval_cfg["eval_episodes"]
+    n_eval_ep  = args.eval_episodes if args.eval_episodes is not None else eval_cfg["eval_episodes"]
     save_freq  = cfg["logging"]["save_freq"]
 
     steps_done = 0
@@ -209,6 +210,12 @@ def main():
         # Evaluate
         if not args.no_eval:
             metrics = run_eval(model, eval_env, n_eval_ep)
+            # Close the viewer window after each eval so it does not stay
+            # visible during training.  close() only destroys the viewer thread
+            # and sets _viewer=None; the env itself remains valid.  The next
+            # run_eval() call triggers render() → launch_passive() to reopen.
+            if args.render:
+                eval_env.close()
             metrics["timestep"] = steps_done
             metrics["wall_time"] = round(time.time() - t_start, 1)
             with open(metrics_path, "a", newline="") as f:

@@ -47,6 +47,7 @@ class BaseIKSolver(abc.ABC):
         data: m.MjData,
         end_effector_body: str,
         end_effector_site: t.Optional[str] = None,
+        end_effector_normal_site: t.Optional[str] = None,
     ):
         """
         Initialize IK solver.
@@ -63,6 +64,8 @@ class BaseIKSolver(abc.ABC):
         self.ee_body_id = model.body(end_effector_body).id
         self.ee_site_name = end_effector_site
         self.ee_site_id = None if end_effector_site is None else model.site(end_effector_site).id
+        self.ee_normal_site_name = end_effector_normal_site
+        self.ee_normal_site_id = None if end_effector_normal_site is None else model.site(end_effector_normal_site).id
 
     @abc.abstractmethod
     def solve(self, target_position: np.ndarray, target_orientation: t.Optional[np.ndarray] = None, initial_guess: t.Optional[np.ndarray] = None, target_normal: t.Optional[np.ndarray] = None) -> t.Tuple[np.ndarray, bool]:
@@ -79,9 +82,9 @@ class BaseIKSolver(abc.ABC):
                               If None, only position is constrained (unless target_normal set)
             initial_guess: (n_dof,) starting joint configuration (optional)
                          A good initial guess can significantly improve convergence
-            target_normal: (3,) desired end-effector +Z axis direction in world frame.
-                           If provided, orientation matching is limited to the normal
-                           (twist about the normal is left unconstrained).
+            target_normal: (3,) desired paddle face normal direction in world frame.
+                           Aligns the blade face normal (body -Y axis) with this
+                           direction; twist about the normal is left unconstrained.
         
         Returns:
             Tuple of:
@@ -125,7 +128,10 @@ class BaseIKSolver(abc.ABC):
             if self.ee_site_id is not None:
                 position = self.data.site_xpos[self.ee_site_id].copy()
                 quaternion = np.zeros(4, dtype=np.float64)
-                m.mju_mat2Quat(quaternion, self.data.site_xmat[self.ee_site_id].copy())
+                # Orientation can be sourced from a dedicated normal site so
+                # IK, RL observation, and viewer debug arrows share one frame.
+                quat_site_id = self.ee_normal_site_id if self.ee_normal_site_id is not None else self.ee_site_id
+                m.mju_mat2Quat(quaternion, self.data.site_xmat[quat_site_id].copy())
             else:
                 position = self.data.body(self.ee_body_name).xpos.copy()
                 quaternion = self.data.body(self.ee_body_name).xquat.copy()
@@ -175,6 +181,7 @@ class NumericalIKSolver(BaseIKSolver):
         data: m.MjData,
         end_effector_body: str,
         end_effector_site: t.Optional[str] = None,
+        end_effector_normal_site: t.Optional[str] = None,
         position_weight: float = 1.0,
         orientation_weight: float = 0.1,
         joint_limit_margin: float = 0.01,
@@ -198,7 +205,13 @@ class NumericalIKSolver(BaseIKSolver):
             max_iterations: Maximum optimization iterations
                           More iterations = potentially better solution but slower
         """
-        super().__init__(model, data, end_effector_body, end_effector_site=end_effector_site)
+        super().__init__(
+            model,
+            data,
+            end_effector_body,
+            end_effector_site=end_effector_site,
+            end_effector_normal_site=end_effector_normal_site,
+        )
         
         self.w_pos = position_weight
         self.w_ori = orientation_weight
@@ -224,7 +237,7 @@ class NumericalIKSolver(BaseIKSolver):
         Args:
             target_position: (3,) [x, y, z] position
             target_orientation: (3,) [rx, ry, rz] Euler angles or (4,) quaternion (optional)
-            target_normal: (3,) desired end-effector +Z axis direction in world frame.
+            target_normal: (3,) desired paddle face normal direction in world frame.
                            If provided, twist about the normal is ignored.
             initial_guess: (n_dof,) starting configuration (optional)
             
@@ -291,9 +304,10 @@ class NumericalIKSolver(BaseIKSolver):
             # Orientation error (if target orientation specified)
             ori_error = 0.0
             if target_normal_vec is not None:
-                # Align end-effector +Z axis with target normal (twist ignored).
+                # Align paddle face normal (body -Y axis) with target normal.
+                # The visual mesh euler="1.5708 0 0" maps the blade face to body -Y.
                 m.mju_quat2Mat(quat_mat, current_quat)
-                current_z = quat_mat.reshape(3, 3)[:, 2]
+                current_z = -quat_mat.reshape(3, 3)[:, 1]   # body -Y
                 dot = float(np.dot(current_z, target_normal_vec))
                 dot = float(np.clip(dot, -1.0, 1.0))
                 ori_error = np.arccos(dot) ** 2
@@ -509,6 +523,7 @@ class JacobianIKSolver(BaseIKSolver):
         data: m.MjData,
         end_effector_body: str,
         end_effector_site: t.Optional[str] = None,
+        end_effector_normal_site: t.Optional[str] = None,
         step_size: float = 0.1,
         max_iterations: int = 100,
         tolerance: float = 1e-4,
@@ -527,7 +542,13 @@ class JacobianIKSolver(BaseIKSolver):
             tolerance: Convergence tolerance (position error in meters)
                      When error drops below this, we consider it solved
         """
-        super().__init__(model, data, end_effector_body, end_effector_site=end_effector_site)
+        super().__init__(
+            model,
+            data,
+            end_effector_body,
+            end_effector_site=end_effector_site,
+            end_effector_normal_site=end_effector_normal_site,
+        )
         
         self.alpha = step_size
         self.max_iter = max_iterations
