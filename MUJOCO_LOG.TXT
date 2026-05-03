@@ -1,9 +1,0 @@
-Wed Apr 15 00:54:48 2026
-ERROR: could not create window
-
-Wed Apr 15 01:03:26 2026
-ERROR: could not create window
-
-Wed Apr 15 01:26:35 2026
-ERROR: could not create window
-

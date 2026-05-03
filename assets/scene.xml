@@ -112,35 +112,35 @@
     <!-- FRANKA FR3 ROBOT -->
     <body name="fr3_link0" pos="1.5 0 0.76" quat="0 0 0 1">
       <inertial pos="-0.0172 0.0004 0.0745" mass="2.3966" diaginertia="0.009 0.0115 0.0085"/>
-      <geom type="mesh" mesh="link0_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+      <geom type="mesh" mesh="link0_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
       <body name="fr3_link1" pos="0 0 0.333">
         <inertial pos="0.0003 -0.0272 0.0618" mass="2.7409" diaginertia="0.01 0.0087 0.0099"/>
         <joint name="fr3_joint1" type="hinge" axis="0 0 1" range="-2.9007 2.9007" damping="1" frictionloss="0.1"/>
-        <geom type="mesh" mesh="link1_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+        <geom type="mesh" mesh="link1_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
         <body name="fr3_link2" pos="0 0 0" quat="0.707107 -0.707107 0 0">
           <inertial pos="-0.0006 0.0503 0.0691" mass="2.7402" diaginertia="0.01 0.0098 0.0088"/>
           <joint name="fr3_joint2" type="hinge" axis="0 0 1" range="-1.8326 1.8326" damping="1" frictionloss="0.1"/>
-          <geom type="mesh" mesh="link2_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+          <geom type="mesh" mesh="link2_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
           <body name="fr3_link3" pos="0 -0.316 0" quat="0.707107 0.707107 0 0">
             <inertial pos="0.0269 0.0387 -0.0738" mass="2.3883" diaginertia="0.0079 0.0068 0.0073"/>
             <joint name="fr3_joint3" type="hinge" axis="0 0 1" range="-2.9007 2.9007" damping="1" frictionloss="0.1"/>
-            <geom type="mesh" mesh="link3_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+            <geom type="mesh" mesh="link3_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
             <body name="fr3_link4" pos="0.0825 0 0" quat="0.707107 0.707107 0 0">
               <inertial pos="-0.0532 0.0459 0.0227" mass="2.3883" diaginertia="0.0079 0.0068 0.0073"/>
               <joint name="fr3_joint4" type="hinge" axis="0 0 1" range="-3.0718 -0.0698" damping="1" frictionloss="0.1"/>
-              <geom type="mesh" mesh="link4_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+              <geom type="mesh" mesh="link4_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
               <body name="fr3_link5" pos="-0.0825 0.384 0" quat="0.707107 -0.707107 0 0">
                 <inertial pos="0.0001 -0.0614 0.0304" mass="2.7337" diaginertia="0.0136 0.0114 0.0049"/>
                 <joint name="fr3_joint5" type="hinge" axis="0 0 1" range="-2.8774 2.8774" damping="0.5" frictionloss="0.1"/>
-                <geom type="mesh" mesh="link5_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+                <geom type="mesh" mesh="link5_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
                 <body name="fr3_link6" pos="0 0 0" quat="0.707107 0.707107 0 0">
                   <inertial pos="0.0511 0.0094 0.0009" mass="1.6667" diaginertia="0.0024 0.0021 0.0021"/>
                   <joint name="fr3_joint6" type="hinge" axis="0 0 1" range="-0.0175 3.7525" damping="0.5" frictionloss="0.1"/>
-                  <geom type="mesh" mesh="link6_mesh" material="robot_white" contype="1" conaffinity="1" group="0"/>
+                  <geom type="mesh" mesh="link6_mesh" material="robot_white" contype="0" conaffinity="0" group="0"/>
                   <body name="fr3_link7" pos="0.088 0 0" quat="0.707107 0.707107 0 0">
                     <inertial pos="0.0099 0.0099 0.0235" mass="0.7355" fullinertia="0.0015 0.0014 0.0005 0.0001 0.0001 0.0001"/>
                     <joint name="fr3_joint7" type="hinge" axis="0 0 1" range="-3.0543 3.0543" damping="0.5" frictionloss="0.1"/>
-                    <geom type="mesh" mesh="link7_mesh" contype="1" conaffinity="1" group="0"/>
+                    <geom type="mesh" mesh="link7_mesh" contype="0" conaffinity="0" group="0"/>
                     <body name="fr3_link8" pos="0 0 0.107">
                       <inertial pos="0 0 0" mass="0.01" diaginertia="0.001 0.001 0.001"/>
                       <body name="paddle" pos="0 0 0.157" quat="1 0 0 0">
@@ -189,13 +189,13 @@
   </worldbody>
   
   <actuator>
-    <position name="pos_joint1" joint="fr3_joint1" kp="200" kv="20" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
-    <position name="pos_joint2" joint="fr3_joint2" kp="200" kv="20" ctrlrange="-1.8326 1.8326" forcerange="-87 87"/>
-    <position name="pos_joint3" joint="fr3_joint3" kp="200" kv="20" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
-    <position name="pos_joint4" joint="fr3_joint4" kp="200" kv="20" ctrlrange="-3.0718 -0.0698" forcerange="-87 87"/>
-    <position name="pos_joint5" joint="fr3_joint5" kp="200" kv="20" ctrlrange="-2.8774 2.8774" forcerange="-87 87"/>
-    <position name="pos_joint6" joint="fr3_joint6" kp="200" kv="20" ctrlrange="-0.0175 3.7525" forcerange="-87 87"/>
-    <position name="pos_joint7" joint="fr3_joint7" kp="200" kv="20" ctrlrange="-3.0543 3.0543" forcerange="-87 87"/>
+    <position name="pos_joint1" joint="fr3_joint1" kp="2000" kv="80" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
+    <position name="pos_joint2" joint="fr3_joint2" kp="2000" kv="80" ctrlrange="-1.8326 1.8326" forcerange="-87 87"/>
+    <position name="pos_joint3" joint="fr3_joint3" kp="2000" kv="80" ctrlrange="-2.9007 2.9007" forcerange="-87 87"/>
+    <position name="pos_joint4" joint="fr3_joint4" kp="2000" kv="80" ctrlrange="-3.0718 -0.0698" forcerange="-87 87"/>
+    <position name="pos_joint5" joint="fr3_joint5" kp="2000" kv="80" ctrlrange="-2.8774 2.8774" forcerange="-87 87"/>
+    <position name="pos_joint6" joint="fr3_joint6" kp="2000" kv="80" ctrlrange="-0.0175 3.7525" forcerange="-87 87"/>
+    <position name="pos_joint7" joint="fr3_joint7" kp="2000" kv="80" ctrlrange="-3.0543 3.0543" forcerange="-87 87"/>
     <motor name="torque_joint1" joint="fr3_joint1" gear="1" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="torque_joint2" joint="fr3_joint2" gear="1" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="torque_joint3" joint="fr3_joint3" gear="1" ctrlrange="-87 87" ctrllimited="true"/>
@@ -237,12 +237,18 @@
   
   <contact>
     <!-- ═══ BALL CONTACTS ═══════════════════════════════════════════════════ -->
-    <!-- Ball-Table: elastic bounce (target COR ≈ 0.85).
+    <!-- Ball-Table: elastic bounce (measured COR ≈ 0.58 average).
          solref[0] ≥ 5×timestep = 0.005s minimum to avoid numerical explosion.
-         solref[1] = dampratio: 0.2 = underdamped → high restitution / elastic bounce.
+         solref[1] = dampratio: stability boundary is 0.15 (below that the constraint
+         becomes numerically unstable and COR exceeds 1.0 at low-speed impacts).
+         Empirically measured effective COR with 1 ms timestep:
+           damratio 0.20 → COR ≈ 0.43  (ball barely rises after 2nd bounce — too low)
+           damratio 0.15 → COR ≈ 0.55 (borderline — inconsistent across bounce speeds)
+           damratio 0.16 → COR ≈ 0.58  (stable, consistent; 13 cm apex after 2nd bounce)
+           damratio 0.14 → solver instability (COR > 1 at lower impact speeds)
          solimp high dmax=0.999 → hard constraint, minimises penetration. -->
     <pair geom1="ball_geom" geom2="table_top"
-          solref="0.005 0.2" solimp="0.97 0.999 0.001"
+          solref="0.005 0.16" solimp="0.97 0.999 0.001"
           friction="0.4 0.002 0.0001" condim="4"/>
 
     <!-- Ball-Floor: moderate bounce (COR ≈ 0.6) -->

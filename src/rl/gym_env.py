@@ -701,10 +701,85 @@ class Environment(gym.Env):
         }
         return obs, ep_reward, terminated, truncated, info_out
 
+    # ── Visualisation helpers ─────────────────────────────────────────────────
+
+    def _update_impact_marker(self) -> None:
+        """
+        Draw a green sphere + arrow into ``viewer.user_scn`` every render frame.
+
+        Sphere  : intended impact point
+        Arrow   : paddle normal at impact (direction the ball is deflected)
+
+        Mode-specific source
+        --------------------
+        task_space : ``pipeline.last_impact_pos`` / ``pipeline.last_paddle_normal``
+                     (explicit policy outputs decoded from the 10-D action).
+        joint_space: ballistic ball prediction 10 policy-steps ahead as the
+                     intercept target; current paddle normal as orientation.
+        """
+        if self._viewer is None:
+            return
+        try:
+            # ── Compute impact position and orientation ────────────────────
+            if (self.mode == "task_space"
+                    and self._pipeline.last_impact_pos is not None
+                    and self._pipeline.last_paddle_normal is not None):
+                pos    = self._pipeline.last_impact_pos.astype(np.float64)
+                normal = self._pipeline.last_paddle_normal.astype(np.float64)
+            else:
+                # joint_space: use ballistic ball prediction as the target
+                ball = self.get_ball_state()
+                dt   = 10.0 * self.action_repeat * self.dt   # 0.2 s look-ahead
+                g    = np.array([0.0, 0.0, -9.81])
+                pos  = (ball["position"]
+                        + ball["velocity"] * dt
+                        + 0.5 * g * dt ** 2).astype(np.float64)
+                pos[2] = max(float(pos[2]), 0.5)  # don't predict below floor
+                normal = self.get_paddle_normal().astype(np.float64)
+
+            tip = pos + normal * 0.15   # arrow tip: 15 cm along normal
+
+            _GREEN   = np.array([0.0, 1.0, 0.0, 0.8],  dtype=np.float32)
+            _ZERO3   = np.zeros(3,  dtype=np.float64)
+            _EYE9    = np.eye(3,    dtype=np.float64).flatten()
+            _SPHERE_SIZE = np.full(3, 0.025, dtype=np.float64)
+
+            with self._viewer.lock():
+                scn = self._viewer.user_scn
+                scn.ngeom = 0
+                if scn.maxgeom < 2:
+                    return
+
+                # Geom 0 — sphere at impact point
+                mujoco.mjv_initGeom(
+                    scn.geoms[0],
+                    mujoco.mjtGeom.mjGEOM_SPHERE,
+                    _SPHERE_SIZE, pos, _EYE9, _GREEN,
+                )
+                scn.ngeom = 1
+
+                # Geom 1 — arrow along paddle normal
+                # mjv_initGeom first (sets rgba); mjv_connector then (sets shape)
+                mujoco.mjv_initGeom(
+                    scn.geoms[1],
+                    mujoco.mjtGeom.mjGEOM_ARROW,
+                    _ZERO3, _ZERO3, _EYE9, _GREEN,
+                )
+                mujoco.mjv_connector(
+                    scn.geoms[1],
+                    mujoco.mjtGeom.mjGEOM_ARROW,
+                    0.007,   # shaft diameter (m)
+                    pos, tip,
+                )
+                scn.ngeom = 2
+        except Exception:
+            pass   # never crash the sim if the viewer API changes
+
     def render(self):
         if self.render_mode == "human":
             if self._viewer is None:
                 self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self._update_impact_marker()
             self._viewer.sync()
 
     def close(self):

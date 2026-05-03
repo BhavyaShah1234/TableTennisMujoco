@@ -291,12 +291,12 @@ class ControlPipeline:
     _MAX_SAFE_JOINT_SPEED = 1.0
     # Maximum joint delta per policy step (joint_space mode: delta actions;
     # task_space mode: per-joint IK output clamping).
-    # 0.25 rad/step: controller (kp=200, kd≈31) reaches ~0.02–0.06 rad actual
-    # displacement per step depending on joint inertia — visible arm motion at
-    # 50 Hz.  Implied velocity (0.25×50=12.5 rad/s) is a commanded reference;
-    # actual joint velocity is bounded by the controller response and inertia,
-    # staying within FR3 limits in simulation.
-    _DELTA_Q_MAX = 0.25
+    # 0.50 rad/step saturates the position actuators (kp=200 × 0.5 = 100 Nm →
+    # clipped to the 87 Nm forcerange limit), giving maximum controller effort
+    # on every step and roughly doubling actual joint displacement compared with
+    # the previous 0.25 rad/step setting.  Instability is caught by the
+    # |qacc| > 1e5 guard in env.step(), so saturation is safe here.
+    _DELTA_Q_MAX = 0.50
     _PADDLE_BLADE_HALF_THICKNESS = 0.00325
     _CONTACT_MARGIN = 0.002
     _MAX_STATIC_TORQUE_RATIO = 0.95

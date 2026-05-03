@@ -45,6 +45,8 @@ def parse_args():
     p.add_argument("--no-eval", action="store_true", help="Skip periodic evaluation (faster)")
     p.add_argument("--render", action="store_true", help="Launch MuJoCo viewer during evaluation")
     p.add_argument("--eval-episodes", type=int, default=None, help="Episodes per evaluation (overrides config)")
+    p.add_argument("--eval-freq", type=int, default=None, help="Policy steps between evaluations (overrides config default: %(default)s)")
+    p.add_argument("--save-freq", type=int, default=None, help="Policy steps between checkpoints (overrides config default: %(default)s)")
     p.add_argument("--load", default=None, help="Path to existing model to continue training")
     return p.parse_args(), cfg
 
@@ -79,44 +81,46 @@ def run_eval(model, env, n_episodes: int) -> dict:
 
     Returns
     -------
-    dict with mean_reward, std_reward, hit_rate, other_side_hit_rate,
-    land_rate, net_rate
+    dict with mean_reward, std_reward, hit_rate, other_side_rate, net_rate
+
+    Metric definitions
+    ------------------
+    hit_rate        : fraction of episodes where paddle contacted ball
+    other_side_rate : fraction of episodes where ball landed on opponent's table
+    net_rate        : fraction of episodes where ball touched the net
     """
-    rewards, hits, other_side_hits, lands, nets = [], [], [], [], []
+    rewards, hits, other_sides, nets = [], [], [], []
 
     obs, _ = env.reset()
     ep_reward = 0.0
     ep_count  = 0
-    ep_hits = ep_other_side = ep_land = ep_net = False
+    ep_hits = ep_other_side = ep_net = False
 
     while ep_count < n_episodes:
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
-        ep_reward += reward
-        ep_hits  |= info.get("hit_detected", False)
-        ep_other_side |= info.get("hit_with_other_side", False)
-        ep_land  |= info.get("landed_far_side", False)
-        ep_net   |= info.get("over_net", False)
+        ep_reward     += reward
+        ep_hits       |= info.get("hit_detected",    False)
+        ep_other_side |= info.get("landed_far_side", False)   # ball on opponent's table
+        ep_net        |= info.get("net_contacted",   False)   # ball touched the net
 
         if terminated or truncated:
             rewards.append(ep_reward)
             hits.append(float(ep_hits))
-            other_side_hits.append(float(ep_other_side))
-            lands.append(float(ep_land))
+            other_sides.append(float(ep_other_side))
             nets.append(float(ep_net))
             ep_reward = 0.0
-            ep_hits = ep_other_side = ep_land = ep_net = False
+            ep_hits = ep_other_side = ep_net = False
             ep_count += 1
             obs, _ = env.reset()
 
     import numpy as np
     return {
-        "mean_reward": float(np.mean(rewards)),
-        "std_reward":  float(np.std(rewards)),
-        "hit_rate":    float(np.mean(hits)),
-        "other_side_hit_rate": float(np.mean(other_side_hits)),
-        "land_rate":   float(np.mean(lands)),
-        "net_rate":    float(np.mean(nets)),
+        "mean_reward":    float(np.mean(rewards)),
+        "std_reward":     float(np.std(rewards)),
+        "hit_rate":       float(np.mean(hits)),
+        "other_side_rate": float(np.mean(other_sides)),
+        "net_rate":       float(np.mean(nets)),
     }
 
 
@@ -182,16 +186,16 @@ def main():
     # ── CSV metrics log ─────────────────────────────────────────────
     metrics_path = log_dir / "metrics.csv"
     csv_fields = ["timestep", "mean_reward", "std_reward",
-                  "hit_rate", "other_side_hit_rate", "land_rate", "net_rate", "wall_time"]
+                  "hit_rate", "other_side_rate", "net_rate", "wall_time"]
     with open(metrics_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
 
     # ── Training loop with periodic eval ───────────────────────────
     eval_cfg   = cfg["training"]
-    eval_freq  = eval_cfg["eval_freq"]
+    eval_freq  = args.eval_freq  if args.eval_freq  is not None else eval_cfg["eval_freq"]
     n_eval_ep  = args.eval_episodes if args.eval_episodes is not None else eval_cfg["eval_episodes"]
-    save_freq  = cfg["logging"]["save_freq"]
+    save_freq  = args.save_freq  if args.save_freq  is not None else cfg["logging"]["save_freq"]
 
     steps_done = 0
     t_start    = time.time()
@@ -225,9 +229,8 @@ def main():
                 f"  [step {steps_done:>8,}]  "
                 f"reward={metrics['mean_reward']:+7.2f}±{metrics['std_reward']:.2f}  "
                 f"hit={metrics['hit_rate']:.0%}  "
-                f"other_side={metrics['other_side_hit_rate']:.0%}  "
-                f"net={metrics['net_rate']:.0%}  "
-                f"land={metrics['land_rate']:.0%}"
+                f"other_side={metrics['other_side_rate']:.0%}  "
+                f"net={metrics['net_rate']:.0%}"
             )
 
     # ── Save final model ────────────────────────────────────────────

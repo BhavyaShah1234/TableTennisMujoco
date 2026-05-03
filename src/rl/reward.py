@@ -14,17 +14,18 @@ Reward hierarchy (worst → best)
                              (miss −10, approach ≈ 0)
      −8   Early hit        — paddle touched ball BEFORE first table bounce
                              (touch +5, early_hit −8, no-net −3, approach ≈ −2)
-     −6   Back-face hit    — ball contacted with wrong paddle side, goes backward
+     −6   Back-face hit    — paddle oriented away from ball, pushes it backward;
+                             ball never crosses net
                              (touch +5, other_side −3, no-net −3, approach ≈ −5)
-     −1   Backward hit     — front face, ball doesn't cross net
+     −1   Front hit, no net — front face contact but ball doesn't cross net
                              (touch +5, no-net −3, approach ≈ −3)
-     +3   Correct touch    — post-bounce, front face, ball crosses net
-                             (touch +5, approach ≈ −2)
-     +5   Ideal touch      — correct + paddle below descending ball (from below +2)
-    +15   Far table        — ideal touch + ball lands on opponent's table
+    +13   Correct touch    — post-bounce, front face, ball crosses net
+                             (touch +5, over_net +10, approach ≈ −2)
+    +15   Ideal touch      — correct + paddle below descending ball
+                             (touch +5, from_below +2, over_net +10, approach ≈ −2)
 
-Net contact and over-net transitions are tracked for diagnostics only.
-They do not add positive reward.
+Landing location (close vs far on opponent's table) gives the same reward.
+R_OVER_NET (+10) fires when ball crosses x=0; no extra reward for where it lands.
 
 Per-step dense terms:
   approach reward     : R_APPROACH_PROGRESS × (prev_dist − curr_dist) — progress shaping
@@ -50,14 +51,15 @@ TABLE_Z      =  0.7725
 BALL_R       =  0.020
 
 # ── Sparse reward values ─────────────────────────────────────────────────────
-R_TOUCH         =  +5.0   # paddle contacts ball AFTER first bounce
+R_TOUCH         =  +5.0   # paddle contacts ball AFTER first bounce on robot's side
+R_SECOND_BOUNCE =  +1.0   # bonus: ball bounced on BOTH sides before hit (proper serve return)
 R_TOUCH_OTHER_SIDE = -3.0 # penalty: back-face contact pushes ball backward; was +3.0
 R_FROM_BELOW    =  +2.0   # bonus: paddle below ball while ball descends (correct technique)
 R_HIT_NO_NET    =  -3.0   # terminal: ball was hit but never crossed net
-R_NET_CONTACT   =   0.0   # tracked only; no positive reward
-R_OVER_NET      =   0.0   # tracked only; no positive reward
-R_FAR_SIDE      = +10.0   # additional: ball lands on far table      → cumulative +25
-R_ACCURACY_MAX  =  +5.0   # landing accuracy bonus (on top of far_side, max +30 total)
+R_NET_CONTACT   =  +2.0   # ball hits net from robot's side: right direction, didn't clear
+R_OVER_NET      = +10.0   # ball crosses net to opponent's side (flat; no landing distinction)
+R_FAR_SIDE      =   0.0   # landing on far table gives no extra; reward is flat at R_OVER_NET
+R_ACCURACY_MAX  =   0.0   # accuracy gradient removed; same reward wherever ball lands
 
 R_MISS          = -10.0   # ball passes robot without contact (robot did move)
 R_STATIONARY    =  -5.0   # extra penalty on top of miss when robot barely moved
@@ -115,7 +117,8 @@ class RewardCalculator:
     def reset(self):
         """Reset all per-episode state."""
         # Flags
-        self._bounce_logged    = False
+        self._opponent_bounce_logged = False  # ball bounced on opponent's side (x<0)
+        self._bounce_logged    = False        # ball bounced on robot's side (x>0)
         self._hit_detected     = False
         self._hit_after_bounce = False   # True only when contact occurs after bounce
         self._hit_with_other_side = False
@@ -184,15 +187,18 @@ class RewardCalculator:
 
         # ── Update event flags ────────────────────────────────────────────
         self._update_bounce_flag(ball_pos, ball_vel, step)
-        self._update_hit_flag(ball_pos, paddle_pos, paddle_normal)
+        self._update_hit_flag(ball_pos, ball_vel, paddle_pos, paddle_normal)
         self._update_net_contact_flag()
         self._update_over_net_flag(ball_pos)
         self._update_landed_flag(ball_pos, ball_vel)
         self._update_miss_flag(ball_pos)
 
-        # ── Sparse: touch AFTER first bounce (+5) ────────────────────────
+        # ── Sparse: touch AFTER first bounce on robot's side (+5) ───────
         if self._hit_just_detected and self._hit_after_bounce:
             r += R_TOUCH
+            # Bonus: proper serve return — ball bounced on both sides of the net
+            if self._opponent_bounce_logged:
+                r += R_SECOND_BOUNCE
             if self._other_side_hit_just_detected:
                 r += R_TOUCH_OTHER_SIDE  # −3: back-face contact pushes ball backward
             else:
@@ -205,23 +211,22 @@ class RewardCalculator:
         if self._early_hit_just_detected:
             r += R_EARLY_HIT
 
-        # ── Sparse: ball contacts net after hit (+5; cumulative +10) ─────
-        # Mutually exclusive with over_net.
+        # ── Sparse: ball contacts net from robot's side (+2) ─────────────
+        # Ball went in the right direction but didn't clear the net.
+        # Mutually exclusive with over_net. Also suppresses R_HIT_NO_NET.
         if self._net_contact_just_detected:
             r += R_NET_CONTACT
 
-        # ── Sparse: ball crosses net to far side (+10; cumulative +15) ───
+        # ── Sparse: ball clears net to opponent's side (+10) ─────────────
         if self._over_net_just_detected:
             r += R_OVER_NET
 
-        # ── Sparse: ball lands on opponent's table (+10; cumulative +25) ─
+        # ── Sparse: ball lands on opponent's table ────────────────────────
+        # R_FAR_SIDE = 0 and R_ACCURACY_MAX = 0: landing location gives no
+        # extra reward — reward is flat at R_OVER_NET regardless of where
+        # the ball lands after crossing the net.
         if self._landed_just_detected:
             r += R_FAR_SIDE
-            # Accuracy bonus 0..+5 based on distance from ideal landing zone
-            # centre (−0.5, 0.0); half-table length ≈ 1.37 m normalises dist.
-            ideal_xy = np.array([-0.5, 0.0])
-            acc_dist = float(np.linalg.norm(ball_pos[:2] - ideal_xy))
-            r += R_ACCURACY_MAX * max(0.0, 1.0 - acc_dist / 1.37)
 
         # ── Sparse: miss (robot moved, −10) ──────────────────────────────
         if self._miss_just_detected:
@@ -282,37 +287,58 @@ class RewardCalculator:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _update_bounce_flag(self, ball_pos, ball_vel, step):
-        """Detect first table bounce on robot's own side of the net."""
-        if not self._bounce_logged and step > 5:
-            if (ball_vel[2] > 0.3
-                    and 0.74 < ball_pos[2] < 0.92
-                    and ball_pos[0] > NET_X):
+        """Detect table bounces on both sides of the net.
+
+        Opponent side (x<0): sets _opponent_bounce_logged — used to award the
+        R_SECOND_BOUNCE bonus when the robot returns a proper serve.
+        Robot side (x>0): sets _bounce_logged — gates R_TOUCH / _hit_after_bounce.
+        """
+        if step <= 5:
+            return
+        # Ball just bounced: upward velocity and near table height
+        bouncing = ball_vel[2] > 0.3 and 0.74 < ball_pos[2] < 0.97
+        if bouncing:
+            if not self._opponent_bounce_logged and ball_pos[0] < NET_X:
+                self._opponent_bounce_logged = True
+            if not self._bounce_logged and ball_pos[0] > NET_X:
                 self._bounce_logged = True
 
-    def _update_hit_flag(self, ball_pos, paddle_pos, paddle_normal):
-        """Detect first paddle–ball contact via proximity."""
-        self._hit_just_detected       = False
+    def _update_hit_flag(self, ball_pos, ball_vel, paddle_pos, paddle_normal):
+        """Detect first paddle–ball contact via proximity.
+
+        The ball must be *approaching* the paddle (closing distance) to avoid
+        false positives when the ball flies past the paddle from behind or rolls
+        near the robot arm after bouncing on the floor.
+        """
+        self._hit_just_detected            = False
         self._other_side_hit_just_detected = False
-        self._early_hit_just_detected = False
+        self._early_hit_just_detected      = False
         if self._hit_detected:
             return
         dist = float(np.linalg.norm(paddle_pos - ball_pos))
-        if dist < TOUCH_DIST_THRESHOLD:
-            self._hit_detected      = True
-            self._hit_just_detected = True
-            # Contact is on the opposite paddle face when the ball lies on
-            # the negative side of the configured paddle normal.
-            rel = ball_pos - paddle_pos
-            if float(np.dot(rel, paddle_normal)) < 0.0:
-                self._hit_with_other_side = True
-                self._other_side_hit_just_detected = True
-            if self._bounce_logged:
-                self._hit_after_bounce = True
-            else:
-                # R_TOUCH (+5) fires via _hit_just_detected check in update(),
-                # but _hit_after_bounce stays False, so the caller checks
-                # _early_hit_just_detected and subtracts R_EARLY_HIT (−8).
-                self._early_hit_just_detected = True
+        if dist >= TOUCH_DIST_THRESHOLD:
+            return
+        # Guard: ball must be closing distance with paddle (approaching), not
+        # flying past or rolling away.  dot(ball_vel, ball_pos - paddle_pos) < 0
+        # means ball velocity has a component toward the paddle.
+        approaching = float(np.dot(ball_vel, ball_pos - paddle_pos)) < 0.0
+        if not approaching:
+            return
+        self._hit_detected      = True
+        self._hit_just_detected = True
+        # Contact is on the opposite paddle face when the ball lies on
+        # the negative side of the configured paddle normal.
+        rel = ball_pos - paddle_pos
+        if float(np.dot(rel, paddle_normal)) < 0.0:
+            self._hit_with_other_side          = True
+            self._other_side_hit_just_detected = True
+        if self._bounce_logged:
+            self._hit_after_bounce = True
+        else:
+            # R_TOUCH (+5) fires via _hit_just_detected check in update(),
+            # but _hit_after_bounce stays False, so the caller checks
+            # _early_hit_just_detected and subtracts R_EARLY_HIT (−8).
+            self._early_hit_just_detected = True
 
     def _update_net_contact_flag(self):
         """
@@ -336,23 +362,33 @@ class RewardCalculator:
             pass
 
     def _update_over_net_flag(self, ball_pos):
-        """Detect ball crossing x=0 toward the far side after being hit."""
+        """Detect ball crossing x=0 toward the far side after being hit.
+
+        Height check (ball_pos[2] > TABLE_Z) prevents a ball rolling along the
+        floor under the table from being counted as crossing the net.
+        """
         self._over_net_just_detected = False
         if (not self._over_net
                 and self._hit_detected
                 and not self._net_contacted
                 and self._ball_prev_x is not None
                 and self._ball_prev_x >= NET_X
-                and ball_pos[0] < NET_X):
+                and ball_pos[0] < NET_X
+                and ball_pos[2] > TABLE_Z):
             self._over_net               = True
             self._over_net_just_detected = True
 
     def _update_landed_flag(self, ball_pos, ball_vel):
-        """Detect ball landing on the opponent's table half."""
+        """Detect ball landing on the opponent's table half.
+
+        Height bounds: ball must be at table surface level, not the floor.
+        Lower bound (TABLE_Z - 0.1) prevents a ball that fell to the floor
+        (z ≈ 0.02) from being counted as a table landing.
+        """
         self._landed_just_detected = False
         if (not self._landed_far_side
                 and self._over_net
-                and ball_pos[2] < TABLE_Z + BALL_R + 0.05
+                and TABLE_Z - 0.10 < ball_pos[2] < TABLE_Z + BALL_R + 0.05
                 and ball_vel[2] < -0.3
                 and ball_pos[0] < NET_X):
             self._landed_far_side      = True

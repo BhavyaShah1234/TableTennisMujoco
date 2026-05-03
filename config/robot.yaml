@@ -31,7 +31,9 @@ robot:
   
   # Home configuration (safe starting position)
   # Keep this synchronized with assets/scene.xml keyframe "home".
-  home_position: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.785]
+  # Joint 4 (-1.9 vs -pi/2): deeper elbow bend lowers paddle closer to table height.
+  # Joint 7 (0.785 = pi/4): wrist roll that orients the paddle face toward the net.
+  home_position: [0.0, 0.0, 0.0, -1.9, 0.0, 1.5708, 0.785]
 
 end_effector:
   name: "paddle"

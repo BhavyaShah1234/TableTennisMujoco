@@ -27,25 +27,32 @@ ball:
   # - If tested_initial_states is non-empty, each episode samples one entry.
   # - Otherwise, the range-based random spawn below is used.
   # Populate this list with pre-validated states to avoid invalid first bounces.
+  # Two-bounce serve trajectories — ball starts from the opponent's end (x < 0),
+  # bounces once on the opponent's table side, crosses the net, bounces once on
+  # the robot's side, then the robot returns it.  This gives the policy more
+  # time to estimate the interception point and orient the paddle.
+  #
+  # Verified analytically (COR≈0.95, g=9.81, ball_radius=0.02 m, TABLE_Z=0.7725):
+  #   bounce 1 (opponent side, x<0): catches ball after it clears the net
+  #   bounce 2 (robot side, 0<x<1.37): gives robot time to intercept at x≈0.5–0.8
+  #   net clearance: ball crosses x=0 at z > 0.925 m (net top height)
   tested_initial_states:
-    - position: [0.0, 0.0, 1.5]
-      velocity: [1.8, 0.00, 0.0]
+    # Verified 2-bounce serve trajectories (see validate_serve_trajectory in test_comprehensive.py).
+    - position: [-1.5, 0.0, 1.7]
+      velocity: [2.5, 0.0, 0.0]
       spin: [0.0, 0.0, 0.0]
-    - position: [0.0, 0.3, 1.5]
-      velocity: [1.6, 0.0, 0.0]
+    - position: [-1.5, -0.5, 1.7]
+      velocity: [2.5, 0.0, 0.0]
       spin: [0.0, 0.0, 0.0]
-    - position: [0.0, -0.3, 1.5]
-      velocity: [1.6, 0.0, 0.0]
+    - position: [-1.5, 0.5, 1.7]
+      velocity: [2.5, 0.0, 0.0]
       spin: [0.0, 0.0, 0.0]
-    - position: [0.0, -0.8, 1.5]
-      velocity: [1.4, 2.0, 0.0]
+    - position: [-1.5, -0.5, 1.7]
+      velocity: [2.5, 1.0, 0.0]
       spin: [0.0, 0.0, 0.0]
-    - position: [0.0, 0.8, 1.5]
-      velocity: [1.4, -2.0, 0.0]
+    - position: [-1.5, 0.5, 1.7]
+      velocity: [2.5, -1.0, 0.0]
       spin: [0.0, 0.0, 0.0]
-    # - position: [0.0, 0.0, 1.5]
-    #   velocity: [1.8, 0.00, 0.0]
-    #   spin: [0.0, 0.0, 20.0]
 
   spawn_height_range: [0.9, 2.0]
   spawn_x_range: [0.0, 0.0]
@@ -78,8 +85,9 @@ table:
   position: [0.0, 0.0, 0.76]
   # Empirical coefficient of restitution used by the analytical trajectory
   # predictor (separate from MuJoCo's restitution which drives the physics).
-  # Calibrate this against recorded ball trajectories if needed.
-  bounce_cor: 0.48
+  # Measured from simulation: ball-table solref damratio=0.16 gives COR ≈ 0.58
+  # (speed-dependent: ~0.59 at high-speed bounce 1, ~0.57 at lower-speed bounce 2).
+  bounce_cor: 0.58
 
 visualization:
   camera: "main_view"

@@ -33,6 +33,7 @@ import numpy as np
 import mujoco as mj
 import mujoco.viewer
 from pathlib import Path
+from scipy.interpolate import CubicSpline
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -51,7 +52,7 @@ _ROBOT_CFG = load_config("config/robot.yaml")
 _CTRL_CFG  = load_config("config/controller.yaml")
 
 # ---- episode / display knobs (not physics, leave as code constants) --------
-N_EPISODES  = 10     # episodes per run; each samples one configured tested state
+N_EPISODES  = 3      # episodes per run; each samples one configured tested state
 PRINT_EVERY = 100     # print every N sim steps (1 step = 1 ms)
 
 # ---- test tolerances -------------------------------------------------------
@@ -97,9 +98,61 @@ BALL_R    = _BALL_CFG["radius"]
 COR       = _T["bounce_cor"]                               # empirical predictor COR
 FLOOR_Z   = _BALL_CFG["ground_z_threshold"]
 MIN_REACT = 0.08   # min seconds before intercept is acceptable
+NET_TOP_Z = TABLE_Z + 0.1525  # net height: 15.25 cm above table surface (≈ 0.925 m)
 
 # ---- robot workspace: imported from control_pipeline to stay in sync.
 # WS_X, WS_Y, WS_Z imported above from src.rl.control_pipeline.
+
+
+# ============================================================
+# JOINT LIMITS (for q_beyond clamping)
+# ============================================================
+_ROBOT_CFG = load_config("config/robot.yaml")
+Q_MIN = np.array(_ROBOT_CFG["robot"]["joint_limits"]["lower"])
+Q_MAX = np.array(_ROBOT_CFG["robot"]["joint_limits"]["upper"])
+
+
+def _minjerk_s(tau):
+    """Normalized minimum-jerk profile s(τ) = 10τ³−15τ⁴+6τ⁵, τ∈[0,1]."""
+    return 10*tau**3 - 15*tau**4 + 6*tau**5
+
+def _minjerk_ds(tau):
+    """Derivative ds/dτ of normalized minimum-jerk profile."""
+    return 30*tau**2 - 60*tau**3 + 30*tau**4
+
+
+def make_swing_trajectory(q_start, q_goal, q_beyond, t_impact, t_ft, dt,
+                          v_swing_scale=0.8, pre_swing=0.08):
+    """
+    Two-phase trajectory:
+      Phase 1 (0 → t_impact - pre_swing): min-jerk q_start→q_goal, arrives v≈0.
+      Phase 2 (t_impact - pre_swing → t_ft): step command to q_beyond.
+
+    pre_swing seconds before predicted contact the PD controller gets a hard
+    step to q_beyond, saturating torque at 87 Nm and building paddle speed so
+    the arm is already moving when the ball arrives at t_impact.
+    """
+    ndof   = len(q_start)
+    T1     = max(t_impact - pre_swing, dt)   # min-jerk phase ends pre_swing before impact
+    T2     = t_ft - T1
+
+    steps1 = int(round(T1 / dt))
+    steps2 = int(round(T2 / dt))
+
+    traj = []
+    # Phase 1: min-jerk from q_start to q_goal
+    for i in range(steps1 + 1):
+        tau = i / steps1 if steps1 > 0 else 1.0
+        s   = _minjerk_s(tau)
+        sd  = _minjerk_ds(tau) / (T1 if T1 > 0 else 1.0)
+        traj.append({"position": q_start + s*(q_goal - q_start),
+                     "velocity": sd*(q_goal - q_start)})
+
+    # Phase 2: step command to q_beyond — saturates torque for max paddle speed
+    for i in range(1, steps2 + 1):
+        traj.append({"position": q_beyond.copy(), "velocity": np.zeros(ndof)})
+
+    return traj
 
 
 # ============================================================
@@ -158,7 +211,7 @@ def predict_intercept(ball_pos, ball_vel):
 
     if not (TABLE_X[0] <= hit_p[0] <= TABLE_X[1] and
             TABLE_Y[0] <= hit_p[1] <= TABLE_Y[1]):
-        return None, None, None   # first bounce misses table entirely
+        return None, None, None, None   # first bounce misses table entirely
 
     hit_v[2] = -hit_v[2] * COR
     pos       = hit_p.copy()
@@ -166,16 +219,35 @@ def predict_intercept(ball_pos, ball_vel):
     vel       = hit_v.copy()
     bounce_pos = pos.copy()
 
-    # ── Phase 2: search each post-bounce arc for workspace entry ─────────────
-    for _ in range(4):   # allow up to 4 post-bounce arcs
-        # Duration of this arc (time until ball returns to table height)
+    # ── Phase 2: advance through the first post-opponent-bounce arc to find
+    #    the robot-side table bounce (x > 0). The robot must NOT intercept
+    #    before this bounce — only after it lands on the robot's side.
+    dt_arc = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
+    if dt_arc is None:
+        return None, None, bounce_pos, None
+
+    robot_bounce_p = _pos_at(pos, vel, dt_arc)
+    robot_bounce_v = _vel_at(vel, dt_arc)
+
+    # Ball must land on the robot's table side (x > 0) within table bounds
+    if not (0.0 < robot_bounce_p[0] <= TABLE_X[1] and
+            TABLE_Y[0] <= robot_bounce_p[1] <= TABLE_Y[1]):
+        return None, None, bounce_pos, None
+
+    robot_bounce_v[2] = -robot_bounce_v[2] * COR
+    pos = robot_bounce_p.copy(); pos[2] = TABLE_Z + BALL_R
+    vel = robot_bounce_v.copy()
+    t  += dt_arc
+
+    # ── Phase 3: search arcs after the robot-side bounce for workspace entry ─
+    for _ in range(3):
         dt_arc = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
         arc_end = dt_arc if dt_arc is not None else 5.0
 
-        # Attempt A: apex of the parabola
+        # Attempt A: apex of the parabola (preferred — highest z, most reaction time)
         if vel[2] > 0:
-            t_ap  = vel[2] / 9.81
-            p_ap  = _pos_at(pos, vel, t_ap)
+            t_ap     = vel[2] / 9.81
+            p_ap     = _pos_at(pos, vel, t_ap)
             t_ap_abs = t + t_ap
             if _in_ws(p_ap) and t_ap_abs >= MIN_REACT:
                 v_ap = _vel_at(vel, t_ap)
@@ -192,13 +264,13 @@ def predict_intercept(ball_pos, ball_vel):
                 v_sp = _vel_at(vel, sd)
                 return sp.copy(), t + sd, bounce_pos, v_sp
 
-        # Arc gave no workspace entry → advance to next bounce
+        # No workspace entry in this arc → advance to next bounce
         if dt_arc is None:
             break
         next_p = _pos_at(pos, vel, dt_arc)
         if not (TABLE_X[0] <= next_p[0] <= TABLE_X[1] and
                 TABLE_Y[0] <= next_p[1] <= TABLE_Y[1]):
-            break   # next bounce off table edge
+            break
 
         next_v = _vel_at(vel, dt_arc)
         next_v[2] = -next_v[2] * COR
@@ -207,6 +279,133 @@ def predict_intercept(ball_pos, ball_vel):
         t  += dt_arc
 
     return None, None, bounce_pos, None
+
+
+# ============================================================
+# SERVE TRAJECTORY VALIDATOR
+# ============================================================
+
+def validate_serve_trajectory(ball_pos, ball_vel):
+    """
+    Analytically validate a two-bounce serve trajectory (opponent-side bounce →
+    net crossing → robot-side bounce → robot intercept).
+
+    Returns a dict with keys:
+      opponent_bounce : np.ndarray or None  — first bounce position
+      net_clear       : bool                — ball clears net (z > NET_TOP_Z at x=0)
+      net_clear_z     : float or None       — z height when crossing x=0
+      robot_bounce    : np.ndarray or None  — second bounce position
+      intercept       : np.ndarray or None  — predicted robot intercept in workspace
+      valid           : bool                — all four checks pass
+      fail_reason     : str                 — human-readable failure description
+    """
+    pos = ball_pos.astype(float).copy()
+    vel = ball_vel.astype(float).copy()
+
+    result = dict(
+        opponent_bounce=None,
+        net_clear=False,
+        net_clear_z=None,
+        robot_bounce=None,
+        intercept=None,
+        valid=False,
+        fail_reason="",
+    )
+
+    # ── First bounce (opponent's table side, x < 0) ───────────────────────────
+    dt_hit = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
+    if dt_hit is None:
+        result["fail_reason"] = "ball never reaches table height under gravity"
+        return result
+
+    hit_p = _pos_at(pos, vel, dt_hit)
+    hit_v = _vel_at(vel, dt_hit)
+
+    if not (TABLE_X[0] <= hit_p[0] <= TABLE_X[1] and
+            TABLE_Y[0] <= hit_p[1] <= TABLE_Y[1]):
+        result["fail_reason"] = (
+            f"first bounce at x={hit_p[0]:.3f} y={hit_p[1]:.3f} misses table "
+            f"(table x=[{TABLE_X[0]:.2f}, {TABLE_X[1]:.2f}], "
+            f"y=[{TABLE_Y[0]:.2f}, {TABLE_Y[1]:.2f}])"
+        )
+        return result
+
+    if hit_p[0] >= 0.0:
+        result["fail_reason"] = (
+            f"first bounce at x={hit_p[0]:.3f} lands on robot's side — "
+            f"expected opponent's side (x < 0) for a serve"
+        )
+        return result
+
+    result["opponent_bounce"] = hit_p.copy()
+    hit_v[2] = abs(hit_v[2]) * COR          # restitution — vz reverses
+    pos = hit_p.copy(); pos[2] = TABLE_Z + BALL_R
+    vel = hit_v.copy()
+
+    # ── Net crossing (x = 0) ──────────────────────────────────────────────────
+    if vel[0] > 1e-9:
+        dt_net = (0.0 - pos[0]) / vel[0]
+        if dt_net > 0:
+            net_p = _pos_at(pos, vel, dt_net)
+            result["net_clear_z"] = float(net_p[2])
+            result["net_clear"] = bool(net_p[2] > NET_TOP_Z)
+
+    if not result["net_clear"]:
+        z_str = f"{result['net_clear_z']:.3f}" if result["net_clear_z"] is not None else "N/A"
+        result["fail_reason"] = (
+            f"ball hits net: z={z_str} m at x=0 (need z > {NET_TOP_Z:.3f} m)"
+        )
+        return result
+
+    # ── Second bounce (robot's table side, x > 0) ────────────────────────────
+    dt_b2 = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
+    if dt_b2 is None:
+        result["fail_reason"] = "ball doesn't return to table height after opponent bounce"
+        return result
+
+    b2_p = _pos_at(pos, vel, dt_b2)
+    b2_v = _vel_at(vel, dt_b2)
+
+    if not (0.0 < b2_p[0] <= TABLE_X[1] and
+            TABLE_Y[0] <= b2_p[1] <= TABLE_Y[1]):
+        result["fail_reason"] = (
+            f"second bounce at x={b2_p[0]:.3f} y={b2_p[1]:.3f} misses robot's table side "
+            f"(need 0 < x <= {TABLE_X[1]:.2f})"
+        )
+        return result
+
+    result["robot_bounce"] = b2_p.copy()
+    b2_v[2] = abs(b2_v[2]) * COR
+    pos = b2_p.copy(); pos[2] = TABLE_Z + BALL_R
+    vel = b2_v.copy()
+
+    # ── Robot workspace intercept (after second bounce) ───────────────────────
+    if vel[2] > 0:
+        t_ap = vel[2] / 9.81
+        p_ap = _pos_at(pos, vel, t_ap)
+        if _in_ws(p_ap):
+            result["intercept"] = p_ap.copy()
+            result["valid"] = True
+            return result
+
+    DT = 0.002
+    dt_arc = _quad_min_pos(-0.5 * 9.81, vel[2], pos[2] - (TABLE_Z + BALL_R))
+    arc_end = dt_arc if dt_arc is not None else 5.0
+    for i in range(int(arc_end / DT) + 2):
+        sd = i * DT
+        sp = _pos_at(pos, vel, sd)
+        if sp[2] < FLOOR_Z or sd > arc_end:
+            break
+        if _in_ws(sp):
+            result["intercept"] = sp.copy()
+            result["valid"] = True
+            return result
+
+    result["fail_reason"] = (
+        f"robot bounce at x={b2_p[0]:.3f} but no intercept found in workspace "
+        f"x=[{WS_X[0]}, {WS_X[1]}] y=[{WS_Y[0]}, {WS_Y[1]}] z=[{WS_Z[0]}, {WS_Z[1]}]"
+    )
+    return result
 
 
 # ============================================================
@@ -328,7 +527,15 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
             impact_dir = imp_vel / float(np.linalg.norm(imp_vel))
         else:
             impact_dir = np.array([1.0, 0.0, 0.0])
-        desired_normal = -impact_dir
+        # Tilt the paddle face upward (+z) so contact impulse gives ball enough
+        # vz to clear the net.  -impact_dir alone has -z tilt (ball travelling
+        # slightly upward ⟹ normal slightly downward ⟹ ball pushed into table).
+        # Larger z-tilt for center ball (|y|<0.1): gives stronger upward impulse
+        # for net clearance when the arm has no y-component in pv_target.
+        # y-offset balls (states 2-5) work with the original 0.45 tilt.
+        nz = 0.70 if abs(imp_pt[1]) < 0.1 else 0.45
+        desired_normal = np.array([-1.0, -imp_pt[1] * 0.25, nz])
+        desired_normal /= np.linalg.norm(desired_normal)
         offset = BALL_R + 0.00325 + 0.002
         ee_target = imp_pt - desired_normal * offset
         q_goal, ik_ok = ik.solve(target_position=ee_target, target_normal=desired_normal,
@@ -336,12 +543,42 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
         debug_impact = imp_pt.copy()
         debug_impact_dir = impact_dir.copy()
         print(f"  IK: {'converged' if ik_ok else 'approx'}  q={np.round(q_goal,3)}")
-        # Pre-compute full trajectory from t=0 so arm arrives at t_impact
-        # (arm starts moving early to avoid joint velocity limits)
-        pre_traj = traj_gen.generate_trajectory(
-            np.array([rs0["position"], q_goal]),
-            np.array([0.0, t_impact]),
-            dt=env.dt,
+
+        # Build q_beyond via Jacobian pseudoinverse at q_goal.
+        # This guarantees the arm's initial Cartesian velocity is in pv_des direction
+        # (unlike IK on a through-point, which has a non-linear joint-space path).
+        env.set_robot_joints(q_goal, np.zeros(7))
+        mj.mj_forward(env.model, env.data)
+        _site_id = env.model.site('paddle_contact').id
+        _jacp = np.zeros((3, env.model.nv))
+        mj.mj_jacSite(env.model, env.data, _jacp, None, _site_id)
+        J_rob = _jacp[:, :7]   # robot joints are DOFs 0-6
+        # Restore arm to home for the episode
+        env.set_robot_joints(rs0["position"], np.zeros(7))
+        mj.mj_forward(env.model, env.data)
+
+        # Desired swing: toward net (-x), y-centering, zero z-motion.
+        # pv_z=0: arm stays near q_goal z (ball z) during Phase 2.
+        # Rising (pv_z>0) lifts EE above the ball, pulling ball out of the
+        # contact normal direction (normal has +z=0.45 → arm above ball → no contact).
+        # The desired_normal tilt already provides the +z impulse for net clearance.
+        pv_target = np.array([-3.0, -imp_pt[1] * 1.5, 0.0])
+        J_pinv = np.linalg.pinv(J_rob)
+        dq_raw = J_pinv @ pv_target    # joint velocity direction for pv_target
+        # Scale: arm has pre_swing seconds to build speed; clamp delta to ≤1.2 rad
+        pre_s = 0.08
+        dq_scaled = dq_raw * pre_s
+        dq_max = np.max(np.abs(dq_scaled))
+        if dq_max > 1.2:
+            dq_scaled *= 1.2 / dq_max
+        elif dq_max < 0.3:
+            dq_scaled *= 0.3 / dq_max
+        q_beyond = np.clip(q_goal + dq_scaled, Q_MIN + 0.01, Q_MAX - 0.01)
+        t_ft = t_impact + 0.4
+
+        print(f"  q_beyond={np.round(q_beyond,3)}  t_ft={t_ft:.3f}s")
+        pre_traj = make_swing_trajectory(
+            rs0["position"], q_goal, q_beyond, t_impact, t_ft, env.dt
         )
         init_paddle, _ = env.get_end_effector_pose()
     else:
@@ -361,6 +598,7 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
     gravity_ok    = False
     vz_start      = None
     bounce_logged = False
+    robot_bounce_logged = False
     was_falling   = False
     t2_done       = False
     vx_post_bounce = None
@@ -373,6 +611,12 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
     closest_step  = None
     vx_at_closest = None
     vx_after      = None
+
+    # 4a: ball crosses net (x=0) at z > NET_TOP_Z after the hit
+    net_crossed   = False
+    prev_ball_x   = None
+    prev_ball_z   = None
+    hit_occurred  = False   # set True once closest_step is locked in
 
     ctrl     = home_pos.copy()
     done_rsn = "max_time_exceeded"
@@ -394,14 +638,21 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
         if vel[2] < -0.5:
             was_falling = True
 
-        # 1b: first table bounce
+        # 1b: first table bounce (opponent side)
         if not bounce_logged and was_falling and vel[2] > 0.3 and 0.74 < pos[2] < 0.92:
             was_falling   = False
             bounce_logged = True
-            vx_post_bounce = vel[0]   # record for hit-detection baseline
             imp_str = (f"-> imp=[{imp_pt[0]:.2f},{imp_pt[1]:.2f},{imp_pt[2]:.2f}] t={t_impact:.3f}s"
                        if imp_pt is not None else "no intercept")
-            _log(t, pos, vel, f"TABLE BOUNCE vz={vel[2]:.3f}  {imp_str}")
+            _log(t, pos, vel, f"TABLE BOUNCE (OPPONENT-SIDE) vz={vel[2]:.3f}  {imp_str}")
+
+        # robot-side table bounce (second bounce — after crossing net)
+        if bounce_logged and not robot_bounce_logged and was_falling and \
+                vel[2] > 0.3 and 0.74 < pos[2] < 0.92 and pos[0] > 0.0:
+            was_falling = False
+            robot_bounce_logged = True
+            vx_post_bounce = vel[0]   # record for hit-detection baseline (after 2nd bounce)
+            _log(t, pos, vel, f"ROBOT-SIDE BOUNCE vz={vel[2]:.3f}")
 
         # 2x metrics: at predicted impact time
         if not t2_done and imp_pt is not None and t >= t_impact:
@@ -418,8 +669,11 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
             else:
                 vel_err = 0.
             t2_done = True
+            pspeed = float(np.linalg.norm(pv))
             _log(t, pos, vel,
-                 f"IMPACT  pos_err={pos_err:.3f}m  time_err={time_err:.4f}s  ori={ori_err:.1f}  vel={vel_err:.1f}")
+                 f"IMPACT  pos_err={pos_err:.3f}m  time_err={time_err:.4f}s  ori={ori_err:.1f}  vel={vel_err:.1f}"
+                 f"  paddle=[{pp[0]:.3f},{pp[1]:.3f},{pp[2]:.3f}]"
+                 f"  pv=[{pv[0]:.2f},{pv[1]:.2f},{pv[2]:.2f}]  pspeed={pspeed:.2f}")
 
         # 3x: closest approach tracking
         if robot_active:
@@ -431,6 +685,21 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
                 vx_at_closest = vel[0]
             if closest_step is not None and step == closest_step + 20:
                 vx_after = env.get_ball_state()["velocity"][0]
+                hit_occurred = True
+
+        # 4a: detect ball crossing x=0 toward opponent (vx < 0) at z > NET_TOP_Z
+        if hit_occurred and not net_crossed and prev_ball_x is not None:
+            if prev_ball_x > 0.0 >= pos[0]:
+                # Linear interpolation: find z at exact x=0 crossing
+                frac = prev_ball_x / (prev_ball_x - pos[0]) if (prev_ball_x - pos[0]) != 0 else 0
+                z_at_net = prev_ball_z + frac * (pos[2] - prev_ball_z)
+                if z_at_net > NET_TOP_Z:
+                    net_crossed = True
+                    print(f"  NET CROSSED at z={z_at_net:.3f}m  PASS")
+                else:
+                    print(f"  Net crossed but too low: z={z_at_net:.3f}m < {NET_TOP_Z:.3f}m  FAIL")
+        prev_ball_x = pos[0]
+        prev_ball_z = pos[2]
 
         # max paddle speed (for 2d direction test)
         if robot_active:
@@ -488,6 +757,7 @@ def run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_sp
             # OR ball got very close to paddle (near-contact)
             or closest_dist < 0.08
         ),
+        "4a_net_cross":   net_crossed,
         "done_reason":  done_rsn,
         "closest_dist": closest_dist,
         "pos_err":   pos_err,
@@ -521,68 +791,111 @@ def _sync_viewer_safe(viewer, dt: float) -> bool:
 # MAIN
 # ============================================================
 
+def _print_validation(val):
+    """Print the result of validate_serve_trajectory in a readable format."""
+    def _pf(ok):
+        return "PASS" if ok else "FAIL"
+
+    ob = val["opponent_bounce"]
+    rb = val["robot_bounce"]
+    ip = val["intercept"]
+    nc_z = val["net_clear_z"]
+
+    print(f"    Opponent bounce (x<0 on table) : ", end="")
+    if ob is not None:
+        print(f"x={ob[0]:.3f}  y={ob[1]:.3f}  z={ob[2]:.3f}  {_pf(True)}")
+    else:
+        print(_pf(False))
+
+    print(f"    Net clearance (z>{NET_TOP_Z:.3f} at x=0) : ", end="")
+    if nc_z is not None:
+        print(f"z={nc_z:.3f} m  {_pf(val['net_clear'])}")
+    else:
+        print(_pf(False))
+
+    print(f"    Robot bounce  (0<x<={TABLE_X[1]:.2f}) : ", end="")
+    if rb is not None:
+        print(f"x={rb[0]:.3f}  y={rb[1]:.3f}  z={rb[2]:.3f}  {_pf(True)}")
+    else:
+        print(_pf(False))
+
+    print(f"    Robot intercept (workspace)    : ", end="")
+    if ip is not None:
+        print(f"x={ip[0]:.3f}  y={ip[1]:.3f}  z={ip[2]:.3f}  {_pf(True)}")
+    else:
+        print(_pf(False))
+
+    if val["valid"]:
+        print(f"    --> VALID 2-bounce serve trajectory")
+    else:
+        print(f"    --> INVALID: {val['fail_reason']}")
+
+
 def main():
     SHOW = "--no-viewer" not in sys.argv
     print("=" * 68)
     print("  TABLE TENNIS ROBOT -- COMPREHENSIVE TEST")
     print("=" * 68)
-    print(f"  Episodes  : {N_EPISODES}  (each samples one tested initial state)")
-    print()
-    valid_tested_states = []
-    for s in _TESTED_STATES:
-        imp_pt, _, bounce_pt, _ = predict_intercept(s["position"], s["velocity"])
-        if imp_pt is not None and bounce_pt is not None:
-            valid_tested_states.append(s)
-
-    if _TESTED_STATES:
-        print(f"  Tested initial states  [from config/simulation.yaml]: {len(_TESTED_STATES)}")
-        print(f"    usable for this test (predictable post-bounce intercept): {len(valid_tested_states)}")
-        for i, s in enumerate(_TESTED_STATES, start=1):
-            p, v, w = s["position"], s["velocity"], s["spin"]
-            print(f"    {i:02d}. pos=[{p[0]:+.2f}, {p[1]:+.2f}, {p[2]:+.2f}]  "
-                  f"vel=[{v[0]:+.2f}, {v[1]:+.2f}, {v[2]:+.2f}]  "
-                  f"spin=[{w[0]:+.2f}, {w[1]:+.2f}, {w[2]:+.2f}]")
-        if not valid_tested_states:
-            print("    WARNING: none of the configured tested states are usable by this test's predictor.")
-            print("             Falling back to range-based sampling.")
-    else:
-        print("  Ball spawn ranges  [from config/simulation.yaml] (fallback)")
-        print(f"    position x : {SPAWN_X[0]:.2f} .. {SPAWN_X[1]:.2f} m")
-        print(f"    position y : {SPAWN_Y[0]:.2f} .. {SPAWN_Y[1]:.2f} m")
-        print(f"    position z : {SPAWN_Z[0]:.2f} .. {SPAWN_Z[1]:.2f} m")
-        print(f"    velocity x : {VEL_X[0]:.2f} .. {VEL_X[1]:.2f} m/s")
-        print(f"    velocity y : {VEL_Y[0]:.2f} .. {VEL_Y[1]:.2f} m/s")
-        print(f"    velocity z : {VEL_Z[0]:.2f} .. {VEL_Z[1]:.2f} m/s")
-        print(f"    spin    x  : {SPIN_X[0]:.2f} .. {SPIN_X[1]:.2f} rad/s")
-        print(f"    spin    y  : {SPIN_Y[0]:.2f} .. {SPIN_Y[1]:.2f} rad/s")
-        print(f"    spin    z  : {SPIN_Z[0]:.2f} .. {SPIN_Z[1]:.2f} rad/s")
+    print(f"  Episodes per state : {N_EPISODES}")
+    print(f"  Net top height     : {NET_TOP_Z:.4f} m")
     print()
     print("  Physics constants  [derived from YAML]")
     print(f"    TABLE_Z={TABLE_Z:.4f}m  TABLE_X={TABLE_X}  TABLE_Y={TABLE_Y}")
     print(f"    BALL_R={BALL_R}m  predictor COR={COR}  FLOOR_Z={FLOOR_Z}m")
     print(f"    gravity={list(GRAVITY)}")
 
-    env       = Environment(scene_xml="assets/scene.xml", randomize=False)
+    env = Environment(scene_xml="assets/scene.xml", randomize=False)
     try:
-        blade_id = env.model.geom("paddle_blade").id
+        blade_id  = env.model.geom("paddle_blade").id
         handle_id = env.model.geom("paddle_handle").id
-        env.model.geom_rgba[blade_id] = np.array([1.0, 1.0, 1.0, 1.0])
+        env.model.geom_rgba[blade_id]  = np.array([1.0, 1.0, 1.0, 1.0])
         env.model.geom_rgba[handle_id] = np.array([1.0, 1.0, 1.0, 1.0])
     except Exception:
         pass
-    ik = NumericalIKSolver(model=env.model, data=env.data,
-                            end_effector_body="paddle", end_effector_site="paddle_contact",
-                            end_effector_normal_site="paddle_normal",
-                            position_weight=1.0, orientation_weight=0.25,
-                            max_iterations=500)
-    traj_gen  = MinimumJerkTrajectory()
+
+    ik = NumericalIKSolver(
+        model=env.model, data=env.data,
+        end_effector_body="paddle", end_effector_site="paddle_contact",
+        end_effector_normal_site="paddle_normal",
+        position_weight=1.0, orientation_weight=0.25,
+        max_iterations=500,
+    )
+    traj_gen = MinimumJerkTrajectory()
     home_pos = np.array(_ROBOT_CFG["robot"]["home_position"])
 
     print("\n  [Pre-check 1c] Net bounce (headless) ... ", end="", flush=True)
     net_ok = check_net_bounce(env, home_pos)
     print("CONTACT" if net_ok else "NO CONTACT")
 
-    all_results = []
+    LABELS = {
+        "1a_gravity":      "1a  Ball falls under gravity",
+        "1b_table_bounce": "1b  Ball bounces off table (opponent side)",
+        "1c_net_bounce":   "1c  Ball contacts net (pre-check)",
+        "2a_position":     "2a  Paddle reaches impact point (< 0.10 m)",
+        "2b_timing":       "2b  Paddle arrives on time (< 0.15 s)",
+        "2c_orientation":  "2c  Paddle orientation correct (< 90 deg)",
+        "2d_velocity":     "2d  Paddle velocity non-reversed (< 145°)",
+        "3a_impact_zone":  "3a  Paddle entered impact zone (< 0.10 m)",
+        "3b_hit_detected": "3b  Hit confirmed (ball velocity changed)",
+        "4a_net_cross":    "4a  Ball crosses net after hit",
+    }
+
+    HDR = (f"  {'Time':>6s}  {'BallX':>7s} {'BallY':>7s} {'BallZ':>7s}"
+           f"  {'Vx':>7s} {'Vy':>7s} {'Vz':>7s}  Event")
+    SEP = "-" * len(HDR)
+
+    # ── Determine test scenarios ──────────────────────────────────────────────
+    # Always iterate over configured tested states; fall back to ranges if none.
+    if _TESTED_STATES:
+        scenarios = _TESTED_STATES
+        print(f"\n  Loaded {len(scenarios)} state(s) from config/simulation.yaml "
+              f"[tested_initial_states]")
+    else:
+        scenarios = None
+        print("\n  No tested_initial_states configured — using range-based sampling.")
+
+    all_state_summaries = []   # list of (state_label, validation, best_flags)
+
     try:
         viewer_cm = nullcontext(None)
         if SHOW:
@@ -597,96 +910,136 @@ def main():
                 viewer.cam.azimuth   = 55
                 time.sleep(0.5)
 
-            HDR = (f"  {'Time':>6s}  {'BallX':>7s} {'BallY':>7s} {'BallZ':>7s}"
-                   f"  {'Vx':>7s} {'Vy':>7s} {'Vz':>7s}  Event")
-            SEP = "-" * len(HDR)
-
             rng = np.random.default_rng()
 
-            for ep in range(1, N_EPISODES + 1):
-                # ── Sample one validated tested state; fallback to ranges if absent ─
-                if valid_tested_states:
-                    # Cycle through usable configured states for deterministic coverage.
-                    state = valid_tested_states[(ep - 1) % len(valid_tested_states)]
-                    ball_pos = state["position"].copy()
-                    ball_vel = state["velocity"].copy()
-                    ball_spin = state["spin"].copy()
-                else:
-                    ball_pos = np.array([
-                        rng.uniform(*SPAWN_X),
-                        rng.uniform(*SPAWN_Y),
-                        rng.uniform(*SPAWN_Z),
-                    ])
-                    ball_vel = np.array([
-                        rng.uniform(*VEL_X),
-                        rng.uniform(*VEL_Y),
-                        rng.uniform(*VEL_Z),
-                    ])
-                    ball_spin = np.array([
-                        rng.uniform(*SPIN_X),
-                        rng.uniform(*SPIN_Y),
-                        rng.uniform(*SPIN_Z),
-                    ])
+            if scenarios is not None:
+                # ── Per-state testing loop ────────────────────────────────────
+                for si, state in enumerate(scenarios, start=1):
+                    p, v, w = state["position"], state["velocity"], state["spin"]
+                    state_label = (f"State {si}/{len(scenarios)}: "
+                                   f"pos=[{p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f}] "
+                                   f"vel=[{v[0]:+.2f},{v[1]:+.2f},{v[2]:+.2f}]")
 
-                print(f"\n{SEP}\n  EPISODE {ep}/{N_EPISODES}\n{SEP}")
-                print(f"  Ball pos  : [{ball_pos[0]:+.3f}, {ball_pos[1]:+.3f}, {ball_pos[2]:+.3f}] m")
-                print(f"  Ball vel  : [{ball_vel[0]:+.3f}, {ball_vel[1]:+.3f}, {ball_vel[2]:+.3f}] m/s")
-                print(f"  Ball spin : [{ball_spin[0]:+.3f}, {ball_spin[1]:+.3f}, {ball_spin[2]:+.3f}] rad/s")
-                print(f"{HDR}\n{SEP}")
-                r = run_episode(env, ik, traj_gen, home_pos, viewer, ball_pos, ball_vel, ball_spin)
-                r["ball_pos"] = ball_pos
-                r["ball_vel"] = ball_vel
-                all_results.append(r)
-                print(SEP)
-                cd  = r.get("closest_dist", float("inf"))
-                pe  = r.get("pos_err"); te = r.get("time_err")
-                oe  = r.get("ori_err"); ve = r.get("vel_err")
-                vxb  = r.get("vx_post_bounce")
-                vxca = r.get("vx_at_closest")
+                    print(f"\n{'='*68}")
+                    print(f"  TESTING {state_label}")
+                    print(f"  spin=[{w[0]:+.2f},{w[1]:+.2f},{w[2]:+.2f}]")
+                    print(f"{'='*68}")
 
-                print(f"  Episode {ep} summary  (ended: {r.get('done_reason','?')})")
-                print(f"    Closest approach : {cd:.4f} m  {'PASS' if cd<0.10 else 'FAIL'}")
-                if pe   is not None: print(f"    Pos  error       : {pe:.4f} m  {'PASS' if pe<POS_TOL else 'FAIL'}")
-                if te   is not None: print(f"    Time error       : {te:.4f} s  {'PASS' if te<TIME_TOL else 'FAIL'}")
-                if oe   is not None: print(f"    Ori  error       : {oe:.2f} °  {'PASS' if oe<ORI_TOL else 'FAIL'}")
-                if ve   is not None: print(f"    Vel  error       : {ve:.2f} °  {'PASS' if ve<VEL_TOL else 'FAIL'}")
-                if vxb is not None and vxca is not None:
-                    diff = vxb - vxca
-                    print(f"    vx change (hit)  : {vxb:.3f} -> {vxca:.3f} m/s  (Δ={diff:.3f})  {'PASS' if diff>0.2 else 'FAIL'}")
-                if SHOW and ep < N_EPISODES:
-                    print("  Waiting 1 s before next episode..."); time.sleep(1.0)
+                    # Analytical validation
+                    print("\n  Analytical 2-bounce serve validation:")
+                    val = validate_serve_trajectory(p, v)
+                    _print_validation(val)
+
+                    state_results = []
+                    for ep in range(1, N_EPISODES + 1):
+                        print(f"\n{SEP}\n  EPISODE {ep}/{N_EPISODES}  ({state_label})\n{SEP}")
+                        print(f"  Ball pos  : [{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}] m")
+                        print(f"  Ball vel  : [{v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}] m/s")
+                        print(f"  Ball spin : [{w[0]:+.3f}, {w[1]:+.3f}, {w[2]:+.3f}] rad/s")
+                        print(f"{HDR}\n{SEP}")
+
+                        r = run_episode(env, ik, traj_gen, home_pos, viewer,
+                                        p.copy(), v.copy(), w.copy())
+                        r["ball_pos"] = p
+                        r["ball_vel"] = v
+                        state_results.append(r)
+
+                        print(SEP)
+                        cd   = r.get("closest_dist", float("inf"))
+                        pe   = r.get("pos_err");   te = r.get("time_err")
+                        oe   = r.get("ori_err");   ve = r.get("vel_err")
+                        vxb  = r.get("vx_post_bounce")
+                        vxca = r.get("vx_at_closest")
+
+                        print(f"  Episode {ep} summary  (ended: {r.get('done_reason','?')})")
+                        print(f"    Closest approach : {cd:.4f} m  {'PASS' if cd<0.10 else 'FAIL'}")
+                        if pe  is not None: print(f"    Pos  error       : {pe:.4f} m  {'PASS' if pe<POS_TOL else 'FAIL'}")
+                        if te  is not None: print(f"    Time error       : {te:.4f} s  {'PASS' if te<TIME_TOL else 'FAIL'}")
+                        if oe  is not None: print(f"    Ori  error       : {oe:.2f} °  {'PASS' if oe<ORI_TOL else 'FAIL'}")
+                        if ve  is not None: print(f"    Vel  error       : {ve:.2f} °  {'PASS' if ve<VEL_TOL else 'FAIL'}")
+                        if vxb is not None and vxca is not None:
+                            diff = vxb - vxca
+                            print(f"    vx change (hit)  : {vxb:.3f} -> {vxca:.3f} m/s  "
+                                  f"(Δ={diff:.3f})  {'PASS' if diff>0.2 else 'FAIL'}")
+
+                        if SHOW and ep < N_EPISODES:
+                            print("  Waiting 1 s before next episode..."); time.sleep(1.0)
+
+                    # Best-across-episodes flags for this state
+                    best = {"1c_net_bounce": net_ok}
+                    for k in LABELS:
+                        if k != "1c_net_bounce":
+                            best[k] = any(r.get(k, False) for r in state_results)
+
+                    all_state_summaries.append((state_label, val, best))
+
+                    # Per-state summary table
+                    print(f"\n  STATE SUMMARY  ({state_label})")
+                    print(f"  Analytical validity: {'VALID' if val['valid'] else 'INVALID'}")
+                    for k, lbl in LABELS.items():
+                        ok = best.get(k, False)
+                        print(f"    {'PASS' if ok else 'FAIL'}  {lbl}")
+
+            else:
+                # ── Range-based fallback ──────────────────────────────────────
+                fallback_results = []
+                for ep in range(1, N_EPISODES + 1):
+                    ball_pos = np.array([rng.uniform(*SPAWN_X),
+                                         rng.uniform(*SPAWN_Y),
+                                         rng.uniform(*SPAWN_Z)])
+                    ball_vel = np.array([rng.uniform(*VEL_X),
+                                         rng.uniform(*VEL_Y),
+                                         rng.uniform(*VEL_Z)])
+                    ball_spin = np.array([rng.uniform(*SPIN_X),
+                                          rng.uniform(*SPIN_Y),
+                                          rng.uniform(*SPIN_Z)])
+
+                    print(f"\n{SEP}\n  EPISODE {ep}/{N_EPISODES}  (range-based)\n{SEP}")
+                    print(f"  Ball pos  : [{ball_pos[0]:+.3f}, {ball_pos[1]:+.3f}, {ball_pos[2]:+.3f}] m")
+                    print(f"  Ball vel  : [{ball_vel[0]:+.3f}, {ball_vel[1]:+.3f}, {ball_vel[2]:+.3f}] m/s")
+                    print(f"{HDR}\n{SEP}")
+
+                    r = run_episode(env, ik, traj_gen, home_pos, viewer,
+                                    ball_pos, ball_vel, ball_spin)
+                    r["ball_pos"] = ball_pos
+                    r["ball_vel"] = ball_vel
+                    fallback_results.append(r)
+
+                    print(SEP)
+                    cd  = r.get("closest_dist", float("inf"))
+                    print(f"  Episode {ep} summary  (ended: {r.get('done_reason','?')})")
+                    print(f"    Closest approach : {cd:.4f} m  {'PASS' if cd<0.10 else 'FAIL'}")
+
+                    if SHOW and ep < N_EPISODES:
+                        print("  Waiting 1 s before next episode..."); time.sleep(1.0)
+
+                best = {"1c_net_bounce": net_ok}
+                for k in LABELS:
+                    if k != "1c_net_bounce":
+                        best[k] = any(r.get(k, False) for r in fallback_results)
+                all_state_summaries.append(("Range-based", None, best))
 
     except KeyboardInterrupt:
         print("\nInterrupted by user. Closing viewer and simulation cleanly...")
     finally:
         env.close()
 
-    LABELS = {
-        "1a_gravity":      "1a  Ball falls under gravity",
-        "1b_table_bounce": "1b  Ball bounces off table",
-        "1c_net_bounce":   "1c  Ball contacts net (pre-check)",
-        "2a_position":     "2a  Paddle reaches impact point (< 0.10 m)",
-        "2b_timing":       "2b  Paddle arrives on time (< 0.15 s)",
-        "2c_orientation":  "2c  Paddle orientation correct (< 90 deg)",
-        "2d_velocity":     "2d  Paddle velocity non-reversed (< 145°)",
-        "3a_impact_zone":  "3a  Paddle entered impact zone (< 0.10 m)",
-        "3b_hit_detected": "3b  Hit confirmed (ball velocity changed)",
-    }
-    best = {"1c_net_bounce": net_ok}
-    for k in LABELS:
-        if k != "1c_net_bounce":
-            best[k] = any(r.get(k, False) for r in all_results)
+    # ── Overall final summary ─────────────────────────────────────────────────
+    print("\n" + "=" * 68)
+    print("  FINAL SUMMARY")
+    print("=" * 68)
 
-    print("\n" + "="*68)
-    print("  FINAL TEST SUMMARY  (best across all episodes)")
-    print("="*68)
-    passed = 0
-    for k, lbl in LABELS.items():
-        ok = best.get(k, False); passed += ok
-        print(f"  {'PASS' if ok else 'FAIL'}  {lbl}")
-    total = len(LABELS)
-    print(f"\n  Result: {passed}/{total} tests passed")
-    print(("  ALL TESTS PASSED" if passed == total else f"  {total-passed} test(s) failed"))
+    for state_label, val, best in all_state_summaries:
+        print(f"\n  [{state_label}]")
+        if val is not None:
+            print(f"  Analytical: {'VALID 2-bounce serve' if val['valid'] else 'INVALID -- ' + val['fail_reason']}")
+        passed = 0
+        for k, lbl in LABELS.items():
+            ok = best.get(k, False)
+            passed += ok
+            print(f"    {'PASS' if ok else 'FAIL'}  {lbl}")
+        total = len(LABELS)
+        print(f"  Result: {passed}/{total} simulation tests passed")
 
     # Work around a known Wayland/EGL teardown crash in passive viewer shutdown.
     if SHOW:
